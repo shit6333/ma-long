@@ -1,4 +1,4 @@
-# <img src="docs/assets/icon.png" height="52" align="absmiddle">&nbsp; MA_Long — Long-sequence SLAM / Streaming Reconstruction on MapAnything
+# <img src="docs/assets/icon.png" height="45" align="absmiddle">&nbsp; MA_Long — Long-sequence SLAM / Streaming Reconstruction on MapAnything
 
 ![ma_slam reconstructions](docs/assets/hero.jpg)
 
