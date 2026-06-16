@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--backend", default="ma", choices=["ma", "da3"],
                     help="reconstruction backbone: 'ma' MapAnything (4 modes) | "
                          "'da3' DA3NESTED-GIANT-LARGE-1.1 (metric rgb / rgb+intr, no depth input)")
+    ap.add_argument("--manifold", default="se3", choices=["se3", "sim3", "sl4"],
+                    help="pose-graph backend + inter-submap transform group: "
+                         "se3 (metric, default) | sim3 (+scale, pypose) | sl4 (projective, needs gtsam fork)")
     ap.add_argument("--out", required=True); ap.add_argument("--gt")
     ap.add_argument("--submap_size", type=int, default=DEFAULT_CONFIG["submap_size"])
     ap.add_argument("--no_loop", action="store_true")
@@ -76,6 +79,7 @@ def main():
 
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["submap_size"] = a.submap_size
+    cfg["Graph"]["manifold"] = a.manifold
     cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold,
                        coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window)
     cfg["Pointcloud"].update(voxel_size=a.voxel_size, max_points=a.max_points, conf_coef=a.conf_coef)

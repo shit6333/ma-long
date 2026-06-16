@@ -26,7 +26,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from ma_slam.graph import PoseGraph
+from ma_slam.graph import (PoseGraph, Sim3PoseGraph, _sim3_mul, _sim3_inv,
+                           _mat_to_sim3, _sim3_to_mat)
 from ma_slam.map import GraphMap
 from ma_slam.submap import Submap
 from ma_slam.loop import ImageRetrieval
@@ -48,7 +49,9 @@ DEFAULT_CONFIG: Dict = {
               "anchor_sigma": 1e-6, "loop_sigma": 0.10,
               "loop_robust": "huber", "loop_robust_k": 1.345},
     "Loop": {"enable": True, "sim_threshold": 0.50, "min_submap_gap": 2,
-             "coloc_ratio": 0.70, "max_per_submap": 1, "half_window": 0},
+             "coloc_ratio": 0.70, "max_per_submap": 1, "half_window": 0,
+             # used only by the Sim3 backend (manifold='sim3') via Sim3LoopOptimizer
+             "SIM3_Optimizer": {"lang_version": "python", "max_iterations": 30, "lambda_init": "1e-6"}},
     "Pointcloud": {"voxel_size": 0.0, "max_points": 2_000_000, "conf_coef": 0.75},
 }
 
@@ -59,10 +62,17 @@ class MaSlam:
         self.device = device
         self._model = model
         g = self.cfg["Graph"]
-        self.graph = PoseGraph(manifold=g["manifold"], inner_sigma=g["inner_sigma"],
-                               intra_sigma=g["intra_sigma"], anchor_sigma=g["anchor_sigma"],
-                               loop_sigma=g["loop_sigma"],
-                               loop_robust=g.get("loop_robust"), loop_robust_k=g.get("loop_robust_k", 1.345))
+        if g["manifold"] == "sim3":
+            self.graph = Sim3PoseGraph(self.cfg)        # pypose Sim3LoopOptimizer backend
+        elif g["manifold"] == "sl4":
+            raise NotImplementedError(
+                "manifold='sl4' needs the MIT-SPARK gtsam fork with SL4 "
+                "(build thirdparty/gtsam_with_sl4); not wired yet.")
+        else:
+            self.graph = PoseGraph(manifold="se3", inner_sigma=g["inner_sigma"],
+                                   intra_sigma=g["intra_sigma"], anchor_sigma=g["anchor_sigma"],
+                                   loop_sigma=g["loop_sigma"],
+                                   loop_robust=g.get("loop_robust"), loop_robust_k=g.get("loop_robust_k", 1.345))
         self.map = GraphMap()
         self.retrieval = ImageRetrieval(device=device) if self.cfg["Loop"]["enable"] else None
         self._next_base = 0
@@ -119,24 +129,50 @@ class MaSlam:
             rel = np.linalg.inv(sm.poses_local[i - 1]) @ sm.poses_local[i]
             self.graph.add_between(sm.key(i - 1), sm.key(i), rel, kind="inner")
 
-    def _align_overlap(self, prev: Submap, pl: int, curr: Submap, cl: int):
+    def _align_overlap(self, prev: Submap, pl: int, curr: Submap, cl: int, force_sim3: bool = False):
         """Robust IRLS alignment of the overlap frame's dense point maps.
 
         The overlap frame is the SAME physical image in both submaps (pixel-wise
         correspondence), reconstructed in each submap's local frame. Aligning the two dense
         point maps yields a geometry-based ``(s, R, t)`` mapping curr-local -> prev-local —
         a far stronger inter-submap measurement than tying the single predicted camera pose.
+        ``force_sim3`` estimates the inter-submap scale even for metric models (Sim3 backend).
         """
         Qp, cp = prev.points[pl], prev.conf[pl]
         Qc, cc = curr.points[cl], curr.conf[cl]
         ct = float(min(np.median(cp), np.median(cc)) * 0.1)
-        method = "se3" if self.model.is_metric(self._mode) else "sim3"   # metric -> SE3; scaleless -> Sim3
+        method = "sim3" if force_sim3 else ("se3" if self.model.is_metric(self._mode) else "sim3")
         ic = self.cfg["InterSubmap"]
         acfg = {"Model": {"align_lib": ic["align_lib"], "align_method": method, "IRLS": ic["IRLS"]}}
         return weighted_align_point_maps(Qp[None], cp[None], Qc[None], cc[None],
                                          conf_threshold=ct, config=acfg)
 
     def _add_submap(self, sm: Submap, prev: Submap):
+        if self.cfg["Graph"]["manifold"] == "sim3":
+            self._add_submap_sim3(sm, prev)
+        else:
+            self._add_submap_se3(sm, prev)
+
+    def _add_submap_sim3(self, sm: Submap, prev: Submap):
+        """Sim3 placement: align the overlap point maps WITH scale and accumulate the
+        inter-submap relative as a Sim3 (no per-submap pre-scaling; the graph carries scale)."""
+        pl = prev.last_frame_index()
+        g_pl = _mat_to_sim3(self.graph.get_pose(prev.key(pl)))   # (s,R,t) world<-cam of overlap frame
+        try:
+            s, R, t = self._align_overlap(prev, pl, sm, 0, force_sim3=True)   # Sc -> Sp, with scale
+            Tsc = (s, R, t)
+        except Exception as e:
+            print(f"[ma_slam] sim3 overlap align failed ({e}); identity tie")
+            Tsc = (1.0, np.eye(3), np.zeros(3))
+        Lpl = (1.0, prev.poses_local[pl][:3, :3], prev.poses_local[pl][:3, 3])   # SE3 (s=1)
+        M_pl = _sim3_mul(g_pl, _sim3_inv(*Lpl))      # world <- prev-local (Sim3)
+        M_sc = _sim3_mul(M_pl, Tsc)                  # world <- curr-local (Sim3)
+        for i in range(sm.n):
+            Li = (1.0, sm.poses_local[i][:3, :3], sm.poses_local[i][:3, 3])
+            self.graph.add_pose(sm.key(i), _sim3_to_mat(*_sim3_mul(M_sc, Li)))
+        # intra/inter ties are encoded by the placement; loops added in _loop_closure.
+
+    def _add_submap_se3(self, sm: Submap, prev: Submap):
         pl = prev.last_frame_index()
         G_pl = self.graph.get_pose(prev.key(pl))                 # overlap frame global cam->world
         T_curr = None

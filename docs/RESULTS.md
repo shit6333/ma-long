@@ -179,6 +179,34 @@ as a config option, off by default.)
 
 ---
 
+## 8. Pose-graph manifold: SE3 vs Sim3 — a negative result
+
+`ma_slam` exposes `--manifold {se3,sim3,sl4}` (`se3` default; `sim3` places submaps with a scaled
+overlap alignment and optimizes a Sim(3) pose graph via the vendored pypose `Sim3LoopOptimizer`;
+`sl4` is reserved, not wired). Motivation: MapAnything/DA3 are uncalibrated in RGB mode, so a
+scale/projective gauge between submaps could in principle be absorbed by a higher-DOF manifold.
+
+Tested end-to-end (rgb, submap_size 20, Sim3-ATE / SE3-ATE / scale):
+
+| backbone · scene | **SE3** (default) | **Sim3** |
+|---|---|---|
+| DA3 · s0011 | **0.068 / 0.104 / 0.96** | 0.090 / 0.232 / 0.90 |
+| DA3 · s0231 | **0.093 / 0.104 / 1.02** | 0.101 / 0.117 / 1.03 |
+| MA · s0011  | **0.150 / 0.543 / 0.78** | 0.174 / 0.639 / 0.75 |
+| MA · s0231  | **0.140 / 0.389 / 0.84** | 0.142 / 0.446 / 0.82 |
+
+**SE3 wins or ties everywhere — Sim3 never improves ATE**, and it clearly worsens metric SE3-ATE
+(DA3 s0011 0.104→0.232) because the freed inter-submap scale drifts away from 1.0 and compounds
+across the chain. A per-pair scale correction can fit the overlap better locally yet still degrade
+the *global* trajectory once accumulated. Conclusion: for a metric backbone (DA3 always; MA with
+depth) keep `--manifold se3`. The flag is retained for experimentation, but Sim3 is a loss here.
+
+> Implementation note: the loop edge fed to `Sim3LoopOptimizer` must be `inv(T_ab)` — its edge
+> `(i,j)` constraint is the reverse of gtsam's `BetweenFactor` convention `inv(P_a)@P_b`. Storing it
+> un-inverted makes every loop pull the wrong way and explodes the trajectory (Sim3-ATE → ~1.1–1.4).
+
+---
+
 ## Appendix — offline pipeline ablations (component analysis)
 
 Per-component sweeps on the offline chunk pipeline (`facebook/map-anything`), cs=20 unless noted.

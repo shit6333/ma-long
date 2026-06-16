@@ -120,3 +120,91 @@ class PoseGraph:
 
     def get_num_loops(self) -> int:
         return self.num_loops
+
+
+# --------------------------------------------------------------------------- Sim3 backend
+def _sim3_inv(s, R, t):
+    return 1.0 / s, R.T, -(R.T @ t) / s
+
+
+def _sim3_mul(a, b):
+    sa, Ra, ta = a; sb, Rb, tb = b
+    return sa * sb, Ra @ Rb, sa * (Ra @ tb) + ta
+
+
+def _mat_to_sim3(M):
+    """4x4 (with scale folded as sR in the top-left) -> (s, R, t)."""
+    A = M[:3, :3]
+    s = float(np.cbrt(max(np.linalg.det(A), 1e-12)))
+    return s, A / s, M[:3, 3].copy()
+
+
+def _sim3_to_mat(s, R, t):
+    M = np.eye(4); M[:3, :3] = s * R; M[:3, 3] = t
+    return M
+
+
+class Sim3PoseGraph:
+    """Sim(3) pose graph (same interface as PoseGraph) over the vendored pypose
+    ``Sim3LoopOptimizer``. Nodes are absolute Sim(3) poses; the sequential chain is rebuilt
+    from the (consistent) node placements, loop factors are the extra constraints. Without a
+    loop the chain is exactly satisfiable, so ``optimize`` is a no-op (matches the SE3 case).
+
+    ``get_pose`` returns a 4x4 with scale folded into the top-left block (``s·R``), so point
+    transforms scale correctly and the translation is the metric camera centre (ATE-ready).
+    """
+
+    def __init__(self, cfg: Dict):
+        self.cfg = cfg
+        self.abs: Dict[int, tuple] = {}      # key -> (s, R, t) absolute (world<-cam)
+        self.loops: list = []                # (key_i, key_j, (s,R,t)) relative
+        self.initialized: set = set()
+        self.num_loops = 0
+
+    def add_pose(self, key: int, T_wc: np.ndarray):
+        if key in self.initialized:
+            return
+        self.abs[key] = _mat_to_sim3(np.asarray(T_wc, dtype=np.float64))
+        self.initialized.add(key)
+
+    def has(self, key: int) -> bool:
+        return key in self.initialized
+
+    def add_prior(self, key: int, T_wc: np.ndarray):
+        pass   # node 0 is the chain origin; Sim3LoopOptimizer anchors it implicitly
+
+    def add_between(self, key_a: int, key_b: int, T_ab: np.ndarray, kind: str = "inner"):
+        # intra/inter ties are encoded by the node placements (chain rebuilt in optimize);
+        # only loop factors are extra constraints worth storing.
+        if kind == "loop":
+            # The solver passes T_ab in gtsam's BetweenFactor convention `inv(P_a) @ P_b`,
+            # but Sim3LoopOptimizer's edge (i, j) constraint is the REVERSED `inv(P_j) @ P_i`
+            # = inv(T_ab). Storing T_ab un-inverted makes every loop pull the wrong way and
+            # blows the trajectory up (matches the slam.py loop-direction gotcha).
+            self.loops.append((key_a, key_b, _sim3_inv(*_mat_to_sim3(np.asarray(T_ab, dtype=np.float64)))))
+            self.num_loops += 1
+
+    def optimize(self, verbose: bool = False) -> float:
+        if not self.loops:
+            return 0.0                                  # chain is exact -> no-op
+        from align.sim3loop import Sim3LoopOptimizer
+        from align.sim3utils import accumulate_sim3_transforms
+        nodes = sorted(self.initialized)
+        idx = {g: k for k, g in enumerate(nodes)}
+        absG = [self.abs[g] for g in nodes]
+        seq = [_sim3_mul(_sim3_inv(*absG[k]), absG[k + 1]) for k in range(len(nodes) - 1)]
+        loops = [(idx[i], idx[j], con) for (i, j, con) in self.loops if i in idx and j in idx]
+        if not loops:
+            return 0.0
+        opt = Sim3LoopOptimizer(self.cfg, device="cpu").optimize(seq, loops)
+        opt_rel = [(1.0, np.eye(3), np.zeros(3))] + accumulate_sim3_transforms(opt)
+        abs0 = absG[0]
+        for k, g in enumerate(nodes):
+            self.abs[g] = _sim3_mul(abs0, opt_rel[k])
+        return 0.0
+
+    def get_pose(self, key: int) -> np.ndarray:
+        return _sim3_to_mat(*self.abs[key])
+
+    def get_num_loops(self) -> int:
+        return self.num_loops
