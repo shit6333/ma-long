@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Model weights / caches (download per INSTALL.md — too large for git)
+src/weights/*.ckpt
+src/weights/hf_cache/
+*.safetensors
+*.pt
+*.pth
+
+# Third-party repos (clone separately — see INSTALL.md; not redistributed here)
+thirdparty/
+
+# Local datasets (ship a minimal scene in example_data/ instead)
+data/
+
+# Run outputs (poses, point clouds, logs, experiment results)
+outputs/
+
+# Local caches / scratch
+.cache/
+*.ply
+*.npz
+
+# Claude Code (local dev/agent context)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# OS / editor
+.DS_Store
+*.swp

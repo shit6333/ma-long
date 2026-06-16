@@ -1,0 +1,103 @@
+"""CLI runner for ma_slam (VGGT-SLAM-style submap SLAM on MapAnything).
+
+    python src/ma_slam/run.py --scene data/scene0011_00 --mode rgb+depth+intr \
+        --out outputs/maslam_s0011 --gt data/scene0011_00/gt_pose.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import glob
+import os
+import sys
+from typing import List, Optional
+
+# Make the src/ sibling packages importable when run directly as a script.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+
+from model.inputs import MODES, load_intrinsics
+from ma_slam.solver import MaSlam, DEFAULT_CONFIG
+
+
+def _frames(d: str) -> List[str]:
+    fs: List[str] = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.PNG"):
+        fs += glob.glob(os.path.join(d, ext))
+    return sorted(fs)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ma_slam (VGGT-SLAM-style, MapAnything backbone)")
+    ap.add_argument("--scene"); ap.add_argument("--image_dir"); ap.add_argument("--depth_dir")
+    ap.add_argument("--intrinsic"); ap.add_argument("--mode", default="rgb", choices=list(MODES))
+    ap.add_argument("--backend", default="ma", choices=["ma", "da3"],
+                    help="reconstruction backbone: 'ma' MapAnything (4 modes) | "
+                         "'da3' DA3NESTED-GIANT-LARGE-1.1 (metric rgb / rgb+intr, no depth input)")
+    ap.add_argument("--out", required=True); ap.add_argument("--gt")
+    ap.add_argument("--submap_size", type=int, default=DEFAULT_CONFIG["submap_size"])
+    ap.add_argument("--no_loop", action="store_true")
+    ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
+    ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
+    ap.add_argument("--loop_half_window", type=int, default=DEFAULT_CONFIG["Loop"]["half_window"],
+                    help="verification window radius: 0 = the 2 candidate frames only; "
+                         ">0 also re-infers each frame's in-submap neighbours")
+    ap.add_argument("--voxel_size", type=float, default=DEFAULT_CONFIG["Pointcloud"]["voxel_size"])
+    ap.add_argument("--max_points", type=int, default=DEFAULT_CONFIG["Pointcloud"]["max_points"],
+                    help="cap on merged point-cloud size (uniform random sample); 0 = no cap")
+    ap.add_argument("--conf_coef", type=float, default=DEFAULT_CONFIG["Pointcloud"]["conf_coef"],
+                    help="multiplier on the per-submap confidence threshold (>1 = stricter)")
+    ap.add_argument("--max_frames", type=int, default=0)
+    ap.add_argument("--depth_scale", type=float, default=1000.0)
+    ap.add_argument("--depth_max", type=float, default=0.0,
+                    help="zero out depth beyond this many metres (drops far sensor noise; 0 = off)")
+    ap.add_argument("--device", default="cuda")
+    a = ap.parse_args()
+
+    image_dir = a.image_dir or (os.path.join(a.scene, "rgb") if a.scene else None)
+    if not image_dir:
+        ap.error("provide --scene or --image_dir")
+    depth_dir = a.depth_dir or (os.path.join(a.scene, "depth") if a.scene else None)
+    intr_path = a.intrinsic or (os.path.join(a.scene, "intrinsic.txt") if a.scene else None)
+
+    image_paths = _frames(image_dir)
+    if a.max_frames:
+        image_paths = image_paths[: a.max_frames]
+    need_depth = "depth" in a.mode
+    need_intr = ("intr" in a.mode) or need_depth
+    depth_paths: Optional[List[str]] = None
+    intrinsics: Optional[np.ndarray] = None
+    if need_depth:
+        depth_paths = _frames(depth_dir)[: len(image_paths)]
+    if need_intr:
+        intrinsics = load_intrinsics(intr_path)
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["submap_size"] = a.submap_size
+    cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold,
+                       coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window)
+    cfg["Pointcloud"].update(voxel_size=a.voxel_size, max_points=a.max_points, conf_coef=a.conf_coef)
+
+    model = None
+    if a.backend == "da3":
+        from model.da3_infer import Da3ChunkModel
+        if "depth" in a.mode:
+            ap.error("backend da3 supports rgb / rgb+intr only (DA3 does not ingest depth)")
+        model = Da3ChunkModel(device=a.device)
+
+    res = MaSlam(config=cfg, model=model, device=a.device).run(
+        image_paths, a.out, mode=a.mode, depth_paths=depth_paths,
+        intrinsics=intrinsics, depth_scale=a.depth_scale,
+        depth_max=(a.depth_max if a.depth_max > 0 else None))
+
+    if a.gt:
+        from eval import ate_rmse
+        s = ate_rmse(res["poses_txt"], a.gt, "sim3"); se = ate_rmse(res["poses_txt"], a.gt, "se3")
+        print(f"[ma_slam] Sim3-ATE={s['ate_rmse']:.4f} | SE3-ATE={se['ate_rmse']:.4f} | "
+              f"scale={s['scale']:.3f} | submaps={res['n_submaps']} | loops={res['n_loops']}")
+
+
+if __name__ == "__main__":
+    main()
