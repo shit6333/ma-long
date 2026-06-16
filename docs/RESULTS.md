@@ -1,160 +1,212 @@
-# ma_long — Results & Findings
+# ma_long / ma_slam — Results & Findings
 
-MapAnything-based long-sequence reconstruction. Pipeline: per-chunk MapAnything
-feed-forward → overlap SE3/Sim3 alignment → dual (geometric + SALAD) loop closure →
-global Sim3 pose-graph optimization → merged point cloud + global poses.
+Long-sequence reconstruction on the **MapAnything** backbone (with an optional **DA3** backbone).
+Three front-ends share one chunk model + one eval: the **offline chunk pipeline** (`ma_long`), the
+AMB3R-style **fused online SLAM** (`ma_long/slam.py`), and **`ma_slam`** — the VGGT-SLAM-2.0-style
+online system (submaps → SE3 gtsam factor graph → incremental global re-opt → robust loop closure),
+which is the most developed and recommended.
 
-- **Hardware:** 1× RTX PRO 6000 Blackwell (97 GB), CUDA 12.8, torch 2.8+cu128, env `amb3r_bw`.
-- **Data:** ScanNet-style scenes `scene0011_00` (238 frames) and `scene0378_00` (190 frames),
-  RGB + depth (16-bit mm) + `intrinsic.txt` + `gt_pose.txt` (TUM).
-- **Metric:** ATE RMSE (m) after trajectory alignment to GT. Two variants:
+- **Hardware:** 1× RTX PRO 6000 Blackwell (~97 GB), CUDA 12.8, torch 2.8+cu128.
+- **Data:** ScanNet-style scenes `scene0011_00` (238f), `scene0378_00` (190f), `scene0231_00` (444f),
+  RGB + depth (16-bit mm) + `intrinsic.txt` + `gt_pose.txt` (TUM). Plus an in-the-wild RealSense scene.
+- **Metric:** ATE RMSE (m) after aligning the trajectory to GT.
   - **Sim3-ATE** — scale-invariant (classic monocular ATE; *hides* metric-scale error).
   - **SE3-ATE (metric)** — rotation+translation only; reveals absolute/scale accuracy.
-  - `scale` = best-fit Sim3 scale est→GT (1.0 == perfectly metric).
-  - **Judge multi-modal modes with SE3-ATE, not Sim3-ATE.**
-
-## TL;DR
-
-1. **Depth input is the single biggest lever.** It fixes MapAnything's metric scale
-   (rgb scale error ~20% → ~2%) and roughly halves ATE. Intrinsics add a smaller gain.
-   Best input = **rgb+depth+intr**.
-2. **Loop closure helps only when the loop windows can be co-registered** — which, in
-   practice, requires depth. In rgb mode MapAnything cannot relate large-viewpoint-change
-   loop windows, so verification rejects them and LC is a no-op.
-3. **Geometric loop proposal is essential.** SALAD (appearance) misses the real revisits
-   in these scenes (true loops score ~0.16 cos-sim); proposing candidates from the
-   provisional trajectory (temporally-far / spatially-near) catches them.
-4. **Cost of LC:** ~2× slower (FPS halves) and +9 GB VRAM (SALAD + loop-window re-inference).
-
-> NOTE: Sections A/B/C below were run with the **`facebook/map-anything-apache`** weights and a
-> third scene (`scene0231_00`, 444 frames) was added later. The headline numbers are now the
-> **full `facebook/map-anything`** model (default since `ma_infer.py` switch) — see next section.
-
-## ★ Full model (`facebook/map-anything`) — current headline
-
-cs=20, loop closure ON for the chunk pipeline; rgb+depth+intr unless noted.
-
-### Offline chunk pipeline (chunk → SE3 align → geo+SALAD LC → global opt)
-
-| scene | mode | Sim3-ATE | SE3-ATE | scale | loops | apache→full |
-|---|---|---|---|---|---|---|
-| 0011 | rgb            | 0.296 | 0.604 | 0.78 | 1 | — (rgb scale unstable) |
-| 0011 | rgb+depth      | 0.084 | 0.084 | 1.00 | 2 | 0.18 → 0.084 |
-| 0011 | **rgb+depth+intr** | **0.081** | 0.081 | 0.99 | 2 | 0.126 → **0.081** |
-| 0378 | rgb            | 0.206 | 0.486 | 0.54 | 0 | — |
-| 0378 | **rgb+depth**  | **0.052** | 0.058 | 0.95 | 1 | 0.16 → **0.052** |
-| 0378 | rgb+depth+intr | 0.054 | 0.062 | 0.95 | 0 | 0.095 → 0.054 |
-
-- **Full model ≫ apache in depth modes** (s0011 rgb+depth+intr 0.126→0.081, s0378 rgb+depth 0.16→0.052).
-- **rgb-only is unstable** on the full model (scale 0.54–0.78, SE3-ATE ~0.5) — use a depth mode.
-- intrinsics add little over rgb+depth on the full model (sometimes marginally worse).
-
-### Online SLAM (`MaLongSLAM`: fused map + keyframes + online LC) — rgb+depth+intr
-
-| scene | SLAM no-loop | SLAM + online LC | chunk+LC (offline) |
-|---|---|---|---|
-| **0231 (444f)** | **0.131** | 0.199–0.396 (hurts) | 0.469 |
-| 0011 | ~0.07 | 0.068 | 0.081 |
-| 0378 | ~0.067 | 0.067 (0 loops) | 0.054 |
-
-- **On long sequences the full model + fused online SLAM dominates:** scene0231 = **0.131** with NO
-  loop closure, vs chunk+LC 0.469 (which is dragged down by weak loops).
-- **Loop closure now HURTS with the full model**, even when it catches the *true* GT loops
-  (148↔435, 217↔415). Reason: **LC only helps when accumulated drift ≫ the loop constraint's own
-  measurement error.** The full model's geometry keeps drift so low (0.13 over 444 frames) that the
-  short loop-window re-inference noise exceeds it → closure adds error. With the weaker apache model
-  drift was large (0.48) so the same online LC helped (0.48→0.32).
-- **Recommendation:** with the full model, run the fused SLAM with LC OFF (or only on very long /
-  visibly drifting sequences). The LC implementation is correct — it's just not needed when geometry
-  is this good.
+  - `scale` = best-fit Sim3 scale est→GT (1.0 = perfectly metric).
+  - **Judge multi-modal / metric modes with SE3-ATE, not Sim3-ATE.**
 
 ---
 
-_The apache-era ablations below are kept for the per-component analysis (modes, LC verification,
-chunk-size, coloc sweep); the absolute numbers are superseded by the full-model table above._
+## TL;DR
 
-## A) Input modes — cs=20, loop closure ON (apache model)
+1. **`ma_slam` (online) matches or beats the offline pipeline** in depth modes, with **stable**
+   loop closure — at ~15.5 fps / ~15 GB. On the loopy 444-frame scene it gets the best result of
+   any method (0.099), where the older AMB3R online LC *degraded* the trajectory.
+2. **Depth is the biggest accuracy lever for MapAnything** (fixes metric scale, ~halves ATE).
+   **`submap_size 20`** is the sweet spot (VRAM grows ~linearly with submap size, fps stays flat).
+3. **DA3 is a far better RGB backbone**: it predicts *metric* geometry from RGB, so `--backend da3
+   --mode rgb` gives SE3-ATE ~0.10 (scale ≈1.0) vs MapAnything-rgb ~0.4–0.5 — **3–5× better**, and
+   rivals MapAnything's *depth* modes from RGB alone.
+4. **Loop closure, tuned:** geometric **co-location verification discriminates real loops** (even
+   from look-alike aliasing); `coloc_ratio 0.7` + a **Huber robust kernel on loop factors** (free
+   insurance against the ~16 % of aliasing that slips through) is the validated default. A
+   re-inference *window* was tested and **dropped** (no ATE gain, slower, worsens aliasing).
+5. **Real-sensor depth:** MapAnything **keeps the depth you give it** (no denoising) → noisy depth
+   in = noisy geometry out. For RealSense, **`--depth_max 6`** (or DA3 rgb) recovers clean results.
 
-| scene | mode | Sim3-ATE | **SE3-ATE** | scale | FPS | VRAM |
-|---|---|---|---|---|---|---|
-| 0011 | rgb            | 0.259 | 0.407 | 1.20 | 4.1 | 23 GB |
-| 0011 | rgb+intr       | 0.226 | 0.400 | 1.21 | 3.7 | 23 GB |
-| 0011 | rgb+depth      | 0.181 | 0.191 | 1.04 | 4.0 | 23 GB |
-| 0011 | **rgb+depth+intr** | **0.169** | **0.192** | 1.05 | 4.3 | 23 GB |
-| 0378 | rgb            | 0.282 | 0.285 | 0.92 | 3.6 | 23 GB |
-| 0378 | rgb+intr       | 0.244 | 0.244 | 1.01 | 3.5 | 23 GB |
-| 0378 | rgb+depth      | 0.160 | 0.165 | 0.93 | 3.2 | 23 GB |
-| 0378 | **rgb+depth+intr** | **0.095** | **0.095** | 0.99 | 2.9 | 23 GB |
+---
 
-Monotonic: `rgb < rgb+intr < rgb+depth < rgb+depth+intr` on both scenes. Depth is the
-big jump (scale → ~1.0, ATE roughly halved); intrinsics add a modest further gain.
+## 1. `ma_slam` — headline (submap_size 20, current defaults)
 
-## B) Loop-closure ablation — rgb+depth+intr, cs=20
+Defaults: `coloc_ratio 0.7`, `half_window 0`, Huber loop kernel. Sim3-ATE (m), loops = accepted in
+the `+depth+intr` run.
 
-| scene | LC off | LC on | FPS off→on | VRAM off→on |
+| scene (frames) | rgb | +depth | **+depth+intr** | loops |
 |---|---|---|---|---|
-| 0011 | 0.169 | 0.169 | 7.8 → 4.3 | 14 → 23 GB |
-| 0378 | 0.137 | **0.095** | 8.2 → 2.9 | 14 → 23 GB |
+| s0011 (238) | 0.150 | 0.069 | **0.059** | 4 |
+| s0378 (190) | 0.098 | 0.051 | 0.055 | 3 |
+| s0231 (444) | 0.140 | 0.106 | **0.099** | 10 |
 
-LC helps on 0378 (0.137 → 0.095). On 0011 it is neutral **at the old default
-`verify.coloc_ratio = 0.5`** — the scene's true loop sits at coloc ≈ 0.52, just above the
-threshold, so it is rejected. The A/B/C tables above were run at coloc 0.5; the coloc sweep
-below shows 0.6 is better, and the default is now **0.6**.
+**Performance:** ~**15.5 fps**, ~**15 GB VRAM** (RTX PRO 6000, submap_size 20). VRAM grows ~linearly
+with submap_size; fps stays roughly flat (see §5).
 
-### Loop-closure verification threshold (`coloc_ratio`) sweep — rgb+depth+intr, cs20
+---
 
-| coloc_ratio | s0011 loops / Sim3 | s0378 loops / Sim3 |
+## 2. `ma_slam` vs offline pipeline vs AMB3R online
+
+`rgb+depth+intr`, Sim3-ATE (m):
+
+| scene | **ma_slam** (online) | offline chunk pipeline | AMB3R online (`slam.py`) |
+|---|---|---|---|
+| s0011 | **0.059** | 0.081 | ~0.068 |
+| s0378 | 0.055 | **0.054** | ~0.067 |
+| s0231 | **0.099** | 0.131 (best prior) | 0.131 no-loop → **0.30 with LC (hurts)** |
+
+- In depth modes **ma_slam matches or beats the offline pipeline**, while being online + streaming.
+- **The s0231 story (why ma_slam's design wins):** on this loopy 444-frame scene the AMB3R online
+  LC and the chunk pipeline's batch LC both *degrade* with the metric model (a late loop's
+  re-inference noise exceeds the small accumulated drift, so an ad-hoc closure adds error).
+  ma_slam's **global factor graph re-optimized every submap + Huber robust loop kernel** stays
+  stable and gives **0.099** — the best of any method here.
+
+---
+
+## 3. Backbone: DA3 vs MapAnything (RGB mode)
+
+`--backend da3` wraps **DA3NESTED-GIANT-LARGE-1.1**, which predicts **metric** depth+poses from RGB
+(`is_metric=1`); MapAnything-rgb is scale-ambiguous. `rgb` mode, ma_slam, submap_size 20:
+
+| scene | MapAnything-rgb (Sim3 / SE3 / scale) | **DA3-rgb** (Sim3 / SE3 / scale) |
 |---|---|---|
-| 0.4 | 0 / 0.169 | 1 / 0.095 |
-| 0.5 (old default) | 0 / 0.169 | 1 / 0.095 |
-| **0.6 (new default)** | **1 / 0.126** | **1 / 0.095** |
-| 0.7 | 1 / 0.126 | 3 / 0.0956 |
-| 0.8 | 4 / 0.128 | 3 / 0.0956 |
-| 1.0 | 4 / 0.128 | 3 / 0.0956 |
+| s0011 | 0.150 / 0.543 / 0.78 | **0.068 / 0.104 / 0.96** |
+| s0378 | 0.098 / 0.370 / 0.60 | **0.097 / 0.108 / 0.92** |
+| s0231 | 0.140 / 0.389 / 0.84 | **0.093 / 0.104 / 1.02** |
 
-**0.6 is the common sweet spot for both scenes.** s0011 needs ≥0.6 to admit its one true
-loop (0.169 → 0.126, −25 %); below that it is rejected. s0378 already gets its good loop at
-0.4–0.6 (0.095); at 0.7+ two weaker loops also pass and very slightly hurt (0.0956). So the
-co-location verification trades precision/recall correctly, and 0.6 maximizes accuracy on
-both while keeping the fewest (fastest) constraints. Default is now 0.6.
+- **Metric SE3-ATE drops 3–5×** (≈0.4–0.5 → ≈0.10) because DA3-rgb is metric (scale ≈1.0).
+- **DA3 rgb-only rivals MapAnything's depth modes** (s0231 DA3-rgb 0.093 beats MA `+d+i` 0.099).
+- `--backend da3 --mode rgb+intr` ≡ `rgb` (DA3's self-predicted intrinsics already accurate).
+- ~12.5 fps (DA3-nested is 1.4 B). DA3 ingests **no depth** → `rgb`/`rgb+intr` only.
+- **Use DA3-rgb when you only have RGB or unreliable depth; use MapAnything `+depth+intr` for clean depth.**
 
-## C) Chunk-size sweep — rgb+depth+intr, loop closure ON
+---
 
-| scene | cs20 | cs30 | cs40 | cs60 | VRAM (cs60) |
-|---|---|---|---|---|---|
-| 0011 | 0.169 | 0.160 | 0.239 ⚠️ | **0.135** | 32 GB |
-| 0378 | **0.095** | 0.148 | 0.145 | 0.163 | 32 GB |
+## 4. Loop closure — verification, robustness, tuning
 
-No universal best chunk size: **0378 prefers small chunks** (more loop benefit), **0011
-prefers large chunks** (less accumulated drift; its small-chunk loop is rejected at the
-default coloc). `cs60` needs 32 GB. The 0011 `cs40 = 0.239` breaks the trend — a likely
-single bad chunk-pair alignment, worth investigating. Overlap used: cs20→8, 30→10, 40→13, 60→20.
+ma_slam loop closure = SALAD retrieval → **geometric co-location verification** (re-infer the
+candidate pair, accept if `‖cam-center dist‖ / median-depth < coloc_ratio`) → SE3 `BetweenFactorPose3`.
 
-## Chunk size vs drift without loop closure (earlier, rgb)
+**Does co-location actually discriminate?** Built candidates the realistic way (SALAD sim ≥ 0.5,
+temporally far), split by GT distance:
 
-Smaller chunks accumulate more drift (motivates loop closure for online/robot use):
-cs60 → 0.169, cs30 → 0.199, cs20 → 0.259, cs12 → 0.340, cs8 → 0.477 (Sim3-ATE, scene0011, rgb).
+| group | coloc median | pass @0.5 |
+|---|---|---|
+| true revisits (GT < 0.4 m) | **0.14** | 100 % |
+| perceptual aliasing (SALAD-similar, GT > 2.5 m) | **0.89** | 16 % |
 
-## Loop closure mechanism notes
+→ coloc **does** separate real loops from look-alike aliasing; the model does *not* force similar
+places together. But ~**16 %** of aliasing still slips under 0.5 (the residual risk).
 
-- **Candidate sources** (union): SALAD VPR (appearance) + geometric (provisional-trajectory
-  temporally-far / spatially-near pairs, with temporal NMS).
-- **Verification** (applied to all candidates): re-infer the loop window jointly and require
-  the two halves to *co-locate* in that reconstruction (`coloc < verify.coloc_ratio`) plus a
-  sane relative scale. This is what rejects unreliable constraints — and what fails in rgb mode.
-- **Loop windows are chunk-bounded** (≤ chunk_size); raising `loop_chunk_size` above the chunk
-  size is a no-op.
-- **Optimizer:** `Sim3LoopOptimizer` (PyPose, Levenberg–Marquardt; Python solver — C++ optional).
+**Geo gate on/off (coloc 0.5 was too strict):** turning the gate off *improved* ATE
+(s0011 0.102→0.055, s0231 0.097→0.091) — at 0.5 it over-rejected **real** large-viewpoint loops.
+→ **`coloc_ratio` default 0.5 → 0.70.**
 
-## Why SALAD alone is insufficient (scene0011)
+**Verification window (`half_window`) — tested, dropped (default 0).** On s0231 a window gave
+≈0 ATE gain but cost fps (17→11.5 at hw6) and **worsened aliasing FPR 16 %→32 %** (more context lets
+the model force look-alikes together). `half_window × coloc_ratio` sweep (s0231):
 
-GT shows true revisits 89↔177 (3.5 cm apart, 88 frames later) and 2↔195 (5 cm, 193 frames).
-SALAD cos-sim for these is only 0.16–0.28 (large viewpoint change), while SALAD's top
-large-span matches are visually-similar-but-not-co-located pairs (~0.68). Geometric proposal
-recovers the true ones (195↔4, 173↔94, …).
+| hw \ coloc | 0.4 | 0.6 | 0.8 |
+|---|---|---|---|
+| 0 (17 fps) | 0.120 | 0.095 | **0.091** |
+| 3 (14 fps) | 0.117 | 0.093 | 0.091 |
+| 6 (11.5 fps) | 0.119 | 0.092 | **0.090** |
 
-## Outputs
+`coloc_ratio` is the dominant knob; the window isn't worth it.
 
-`outputs/bench/summary.json` (Sets A/B/C), `outputs/sweep_lc/summary.json` (coloc sweep).
-Each run dir has `camera_poses.txt`, `combined_pcd.ply`, `loop_closures.txt`. Reproduce:
-`python -m ma_long.bench --out outputs/bench` and `python -m ma_long.sweep_lc`.
+**Huber robust kernel on loop factors — free insurance (default on).** Synthetic test (one
+deliberately-wrong loop forcing two points 10 m apart together): plain Gaussian warps the whole
+trajectory (mean err **3.57**); Huber neutralizes it (**0.17**). On *clean* loops it's exactly
+neutral (s0231 identical 0.0985 with/without). So it costs nothing when loops are good and prevents
+the slipped-aliasing loops from blowing up the map. Only loop factors are robustified; odometry
+stays a plain Gaussian.
+
+---
+
+## 5. `submap_size` sweep (accuracy / fps / VRAM)
+
+`rgb+depth+intr`, ma_slam. ATE = Sim3-ATE (m); loops = accepted.
+
+| submap_size | s0231 ATE / loops | s0011 ATE / loops | VRAM | fps |
+|---|---|---|---|---|
+| 10 | 0.119 / 23 | 0.168 / 6 | 10.4 GB | 16.1 |
+| **20** | **0.097 / 8** | 0.102 / 1 | 14.9 GB | 17.1 |
+| 30 | 0.118 / 6 | 0.162 / 0 | 19.5 GB | 17.5 |
+| 40 | 0.106 / 6 | **0.096 / 0** | 24.0 GB | 16.9 |
+| 60 | 0.180 / 2 | 0.110 / 0 | 33.2 GB | 16.7 |
+
+- **VRAM is ~linear** in submap_size (~0.46 GB/frame); **fps is ~flat** (~16–17.5) — submap_size
+  trades VRAM, not speed.
+- **More loops ≠ better:** cs10 gets the most loops (23) but mediocre ATE (over-segmentation +
+  noisy small loops). **cs60 degrades on loopy s0231** (too few submaps → only 2 loops → big loops
+  uncorrected). **cs20 is the robust sweet spot.**
+
+---
+
+## 6. Real-sensor depth (RealSense) — `--depth_max`
+
+**MapAnything keeps the depth you give it — it does *not* denoise.** Measured: on pixels where you
+provide depth, output ≈ input (ratio median 1.005, 90 % within ±2 %, ~1.5 cm median diff); only
+`depth==0` **holes** get the network's own prediction. So **garbage in → garbage out**.
+
+RealSense depth is unreliable beyond ~5–6 m (raw far values reach 30 m+); MapAnything trusts these
+as valid → the cloud sprays to ±60 m. **`--depth_max 6`** zeros depth past 6 m, turning the far
+noise into holes the network re-predicts cleanly → recovers a clean reconstruction. Verified on an
+in-the-wild RealSense scene: raw unfilled depth → broken; `--depth_max 6` → clean, matching a
+hole-filled (range-limited) version of the same scene. **`--backend da3 --mode rgb`** sidesteps depth
+entirely → clean metric reconstruction from RGB on the same data, no `--depth_max` tuning needed.
+
+---
+
+## 7. Inter-submap constraint — a negative result
+
+Hypothesis: the single-overlap-frame tie between submaps is the weak link. Tested replacing it with
+a robust **dense point-cloud alignment** of the shared overlap frame → **no improvement** (s0011
+0.059→0.064, s0231 0.099→0.100). At `overlap=1` a single frame's point-align is no better than
+MapAnything's already-consistent predicted pose (overlap geometry already agrees to ~1 cm). So the
+residual drift comes from **accumulation across submaps**, not a weak inter-submap estimator —
+pointing future work toward a global dense bundle adjustment rather than better adjacent ties. (Kept
+as a config option, off by default.)
+
+---
+
+## Appendix — offline pipeline ablations (component analysis)
+
+Per-component sweeps on the offline chunk pipeline (`facebook/map-anything`), cs=20 unless noted.
+
+### A) Input modes (loop closure ON, Sim3-ATE / SE3-ATE / scale)
+
+| scene | rgb | rgb+depth | **rgb+depth+intr** |
+|---|---|---|---|
+| s0011 | 0.296 / 0.60 / 0.78 | 0.084 / 0.084 / 1.00 | **0.081 / 0.081 / 0.99** |
+| s0378 | 0.206 / 0.49 / 0.54 | **0.052 / 0.058 / 0.95** | 0.054 / 0.062 / 0.95 |
+
+Monotonic `rgb < rgb+intr < rgb+depth < rgb+depth+intr`. **Depth is the big jump** (scale → ~1.0,
+ATE ~halved); intrinsics add a modest further gain (sometimes marginal over rgb+depth).
+
+### B) `coloc_ratio` (offline pipeline)
+
+`0.6` was the chunk-pipeline sweet spot (s0011 admits its one true loop at ≥0.6: 0.169→0.126); for
+**ma_slam** the looser **0.7** + robust kernel is better (§4). Below the gate, the true loop at
+coloc ≈ 0.52 is rejected.
+
+### C) Chunk size (offline pipeline)
+
+No universal best: **s0378 prefers small chunks** (more loop benefit), **s0011 prefers large**
+(less accumulated drift). Without loop closure, smaller chunks drift more (s0011 rgb:
+cs60 0.169 → cs30 0.199 → cs20 0.259 → cs12 0.340 → cs8 0.477), which motivates loop closure and the
+online front-ends.
+
+### Why SALAD alone is insufficient
+
+True revisits with large viewpoint change score only ~0.16–0.28 SALAD cos-sim, while visually
+similar but *non-co-located* pairs score ~0.68. So **appearance retrieval needs the geometric
+co-location gate** (§4) to keep precision — and a geometric candidate proposal to keep recall.

@@ -1,7 +1,7 @@
 # Install — ma_long / ma_slam
 
-Dependency list for this repo. Developed/tested on a **Blackwell** GPU (`sm_120`) with
-**PyTorch 2.8.0 + CUDA 12.8**, Python 3.10. On other GPUs, use the CUDA wheel matching your card.
+Dependency list for this repo. Developed with **PyTorch 2.8.0 + CUDA 12.8**, Python 3.10 —
+adjust the PyTorch CUDA build to match your own GPU / driver / CUDA version.
 
 ```bash
 # create + activate an env (name it whatever you like; `ma_long` used here)
@@ -11,13 +11,12 @@ conda activate ma_long
 
 ---
 
-## 1. PyTorch (Blackwell / CUDA 12.8)
+## 1. PyTorch (CUDA 12.8)
 
 ```bash
-# Blackwell sm_120 REQUIRES a cu128 build — older cu118/cu124 wheels will NOT run.
+# we used CUDA 12.8 (cu128); pick the index/wheel matching your CUDA — see https://pytorch.org/get-started/
 pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
-# sanity: sm_120 must appear in the arch list (Blackwell)
-python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
 ## 2. MapAnything backbone (default `--backend ma`)

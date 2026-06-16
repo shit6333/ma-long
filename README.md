@@ -1,4 +1,8 @@
-# ma_long — long-sequence SLAM / streaming reconstruction on MapAnything
+# <img src="docs/assets/icon.png" height="52" align="absmiddle">&nbsp; MA_Long — Long-sequence SLAM / Streaming Reconstruction on MapAnything
+
+![ma_slam reconstructions](docs/assets/hero.jpg)
+
+<sub>*`ma_slam` dense reconstructions + camera trajectories (red) — scene0011 · scene0378 · scene0231.*</sub>
 
 `ma_long` wraps Meta's **[MapAnything](https://github.com/facebookresearch/map-anything)**
 foundation model into a long-sequence / streaming reconstruction system. Unlike VGGT- or
@@ -176,6 +180,9 @@ CLI: `--init_window --step --kf_threshold --no_loop --loop_dist`.
 - On s0231 (loopy), ma_slam's loop closure is **stable & helpful** (cuts ATE), where the older
   AMB3R online LC *degraded* it (0.131 → 0.30).
 - **Perf:** ~15.5 fps, ~15 GB VRAM (RTX PRO 6000, submap_size 20).
+
+**Full results + ablations** (DA3-vs-MapAnything, loop-closure tuning, submap-size sweep,
+RealSense `--depth_max`, …) → **[docs/RESULTS.md](docs/RESULTS.md)**.
 
 ---
 
