@@ -209,4 +209,17 @@ outputs/        run outputs (git-ignored) · data/  your own datasets (git-ignor
 `ma_slam` and `ma_long` are independent front-ends sharing `model`/`align`/`loop`/`fastloop`/
 `weights`/`eval`. Vendoring rule: do not runtime-import the `thirdparty/` repos — the only
 external model deps are `mapanything` (pip) and, for `--backend da3`, `depth_anything_3`
-(source clone). See `CLAUDE.md` for full implementation notes.
+(source clone). Full results & findings: **[docs/RESULTS.md](docs/RESULTS.md)**.
+
+---
+
+## Acknowledgements
+
+Built on / inspired by these excellent projects:
+
+- **[MapAnything](https://github.com/facebookresearch/map-anything)** — metric multi-view foundation model (default backbone).
+- **[Depth-Anything-3](https://github.com/bytedance-seed/depth-anything-3)** — metric depth + pose from RGB (the `--backend da3` backbone).
+- **[VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM)** — the submap + factor-graph SLAM design `ma_slam` is built on (VGGT-SLAM-2.0-style).
+- **[VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long)** — long-sequence chunk + loop-closure pipeline (architectural blueprint; SALAD loop detector).
+- **[AMB3R](https://github.com/HengyiWang/amb3r)** — fused-map online SLAM (the AMB3R-style front-end).
+- **[SALAD](https://github.com/serizba/salad)** — DINOv2-SALAD visual place recognition (the `dino_salad.ckpt` loop-closure checkpoint).

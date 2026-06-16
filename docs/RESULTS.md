@@ -85,7 +85,8 @@ with submap_size; fps stays roughly flat (see §5).
 - **Metric SE3-ATE drops 3–5×** (≈0.4–0.5 → ≈0.10) because DA3-rgb is metric (scale ≈1.0).
 - **DA3 rgb-only rivals MapAnything's depth modes** (s0231 DA3-rgb 0.093 beats MA `+d+i` 0.099).
 - `--backend da3 --mode rgb+intr` ≡ `rgb` (DA3's self-predicted intrinsics already accurate).
-- ~12.5 fps (DA3-nested is 1.4 B). DA3 ingests **no depth** → `rgb`/`rgb+intr` only.
+- **Perf (submap_size 20):** DA3 **~12.5 fps, ~12 GB VRAM** (DA3-nested is 1.4 B) vs MapAnything
+  **~15.5 fps, ~15 GB**. DA3 ingests **no depth** → `rgb`/`rgb+intr` only.
 - **Use DA3-rgb when you only have RGB or unreliable depth; use MapAnything `+depth+intr` for clean depth.**
 
 ---
