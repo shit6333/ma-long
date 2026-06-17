@@ -69,8 +69,24 @@ class GraphMap:
         pcd.colors = o3d.utility.Vector3dVector(cols)
         if voxel_size and voxel_size > 0:
             pcd = pcd.voxel_down_sample(voxel_size)
-        o3d.io.write_point_cloud(path, pcd)
-        print(f"[ma_slam] point cloud: {len(pcd.points):,} points -> {path}")
+        # Write float32 directly: Open3D's write_point_cloud emits `double` x/y/z, which most
+        # JS/web PLY viewers (three.js PLYLoader, VSCode previews) can't parse -> "Offset is
+        # outside the bounds of the DataView". float32 is universally supported and half the size.
+        xyz = np.asarray(pcd.points, dtype="<f4")
+        rgb = np.clip(np.asarray(pcd.colors) * 255.0 + 0.5, 0, 255).astype("u1")
+        vert = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                         ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+        vert["x"], vert["y"], vert["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        vert["red"], vert["green"], vert["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        header = ("ply\nformat binary_little_endian 1.0\n"
+                  f"element vertex {len(vert)}\n"
+                  "property float x\nproperty float y\nproperty float z\n"
+                  "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                  "end_header\n").encode()
+        with open(path, "wb") as fh:
+            fh.write(header)
+            fh.write(vert.tobytes())
+        print(f"[ma_slam] point cloud: {len(vert):,} points -> {path}")
         return path
 
     def write_poses(self, graph, path: str):

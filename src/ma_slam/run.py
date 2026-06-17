@@ -73,7 +73,14 @@ def main():
     depth_paths: Optional[List[str]] = None
     intrinsics: Optional[np.ndarray] = None
     if need_depth:
-        depth_paths = _frames(depth_dir)[: len(image_paths)]
+        depth_paths = _frames(depth_dir)
+        # color/depth are index-aligned; if counts differ (e.g. a trailing color frame with no
+        # depth), truncate BOTH to the common length so depth_paths[i] never goes out of range.
+        n = min(len(image_paths), len(depth_paths))
+        if len(image_paths) != len(depth_paths):
+            print(f"[ma_slam] color/depth count mismatch ({len(image_paths)}/{len(depth_paths)}); "
+                  f"truncating both to {n}")
+        image_paths, depth_paths = image_paths[:n], depth_paths[:n]
     if need_intr:
         intrinsics = load_intrinsics(intr_path)
 
