@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--loop_half_window", type=int, default=DEFAULT_CONFIG["Loop"]["half_window"],
                     help="verification window radius: 0 = the 2 candidate frames only; "
                          ">0 also re-infers each frame's in-submap neighbours")
+    ap.add_argument("--debug_coloc", action="store_true",
+                    help="dump each loop candidate's two re-inferred windows as a "
+                         "green(query)/red(match) PLY in <out>/coloc/ for visual inspection")
     ap.add_argument("--voxel_size", type=float, default=DEFAULT_CONFIG["Pointcloud"]["voxel_size"])
     ap.add_argument("--max_points", type=int, default=DEFAULT_CONFIG["Pointcloud"]["max_points"],
                     help="cap on merged point-cloud size (uniform random sample); 0 = no cap")
@@ -88,7 +91,8 @@ def main():
     cfg["submap_size"] = a.submap_size
     cfg["Graph"]["manifold"] = a.manifold
     cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold,
-                       coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window)
+                       coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window,
+                       debug_coloc=a.debug_coloc)
     cfg["Pointcloud"].update(voxel_size=a.voxel_size, max_points=a.max_points, conf_coef=a.conf_coef)
 
     model = None

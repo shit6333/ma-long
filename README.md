@@ -135,13 +135,14 @@ one row per frame), `combined_pcd.ply`, and `run_stats.txt`/`loops.txt` (fps, VR
 | | `coloc_ratio` | **0.70** | geometric verification gate (stage 2, precision): re-infer pair, accept if `‖cam-center dist‖ / median-depth < coloc_ratio`. 0.5 over-rejected real loops. |
 | | `min_submap_gap` | 2 | exclude N most-recent submaps as loop targets |
 | | `half_window` | **0** | verification window radius. 0 = the 2 candidate frames only. **Keep 0** — a window helps recall but worsens aliasing FPR (16%→32%) and costs fps. |
+| | `debug_coloc` | False | `--debug_coloc`: dump each loop candidate's two re-inferred windows (query=green, red=match) as a PLY in `<out>/coloc/` (filename = verdict + coloc value) for eyeballing accept/reject. Off = zero cost. |
 | pointcloud | `conf_coef` | 0.75 | keep points with `conf > mean(conf) * conf_coef` (export only) |
 | | `max_points` | 2,000,000 | cap merged cloud (uniform random sample); `0` = no cap |
 | | `voxel_size` | 0.0 | optional voxel downsample (m) |
 
 **CLI overrides** (`src/ma_slam/run.py`): `--submap_size --no_loop --sim_threshold
---coloc_ratio --loop_half_window --voxel_size --max_points --conf_coef --depth_scale
---depth_max --max_frames --device`.
+--coloc_ratio --loop_half_window --debug_coloc --voxel_size --max_points --conf_coef
+--depth_scale --depth_max --max_frames --device`.
 
 ### Real-sensor depth (RealSense etc.) → use `--depth_max`
 MapAnything **keeps the depth you give it** (output ≈ input to ~1 cm on provided pixels;

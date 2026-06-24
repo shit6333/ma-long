@@ -50,6 +50,9 @@ DEFAULT_CONFIG: Dict = {
               "loop_robust": "huber", "loop_robust_k": 1.345},
     "Loop": {"enable": True, "sim_threshold": 0.50, "min_submap_gap": 2,
              "coloc_ratio": 0.70, "max_per_submap": 1, "half_window": 0,
+             # debug: dump each loop candidate's two re-inferred windows as a green(query)/
+             # red(match) PLY in <out>/coloc/ so co-location accept/reject can be eyeballed.
+             "debug_coloc": False,
              # used only by the Sim3 backend (manifold='sim3') via Sim3LoopOptimizer
              "SIM3_Optimizer": {"lang_version": "python", "max_iterations": 30, "lambda_init": "1e-6"}},
     "Pointcloud": {"voxel_size": 0.0, "max_points": 2_000_000, "conf_coef": 0.75},
@@ -78,6 +81,7 @@ class MaSlam:
         self._next_base = 0
         # set in run()
         self._mode = "rgb"; self._input_K = None; self._depth_scale = 1000.0; self._depth_max = None
+        self._coloc_dir: Optional[str] = None    # set in run() when Loop.debug_coloc is on
         self.stats = dict(n_loops=0, n_submaps=0)
         self.loop_log: List[str] = []   # every loop candidate decision (saved to loops.txt)
 
@@ -255,6 +259,8 @@ class MaSlam:
                 f"qimg={qimg} mimg={mimg}")
         self.loop_log.append(line)
         print(f"[ma_slam] {line}")
+        if self._coloc_dir is not None:
+            self._save_coloc_ply(out, la, len(self.loop_log), passed, coloc, cand)
         if not passed:
             return False
         # measurement between the actual query and match frames in the joint reconstruction.
@@ -265,6 +271,50 @@ class MaSlam:
                                rel, kind="loop")
         self.stats["n_loops"] += 1
         return True
+
+    # ------------------------------------------------------------------ coloc debug
+    @staticmethod
+    def _conf_points(pts, conf, color, cap=200_000, rng=None):
+        """Confident points (conf > median) of a window, painted a solid color."""
+        P = pts.reshape(-1, 3)
+        c = conf.reshape(-1)
+        m = (c > np.median(c)) & np.isfinite(P).all(1)
+        P = P[m]
+        if cap and len(P) > cap:
+            rng = rng if rng is not None else np.random.default_rng(0)
+            P = P[rng.choice(len(P), cap, replace=False)]
+        col = np.tile(np.asarray(color, np.uint8), (len(P), 1))
+        return P, col
+
+    def _save_coloc_ply(self, out, la, idx, passed, coloc, cand):
+        """Dump the two re-inferred loop windows (query=green, match=red) to one PLY.
+
+        Points are in the JOINT-local reconstruction frame (the same frame coloc is measured
+        in), so if the loop is real the green and red clouds should sit on top of each other;
+        a rejected candidate shows them flying apart.
+        """
+        wp, cf = out["world_points"], out["world_points_conf"]
+        rng = np.random.default_rng(0)
+        pq, cq = self._conf_points(wp[:la], cf[:la], (0, 220, 0), rng=rng)    # query = green
+        pm, cm = self._conf_points(wp[la:], cf[la:], (220, 0, 0), rng=rng)    # match = red
+        xyz = np.concatenate([pq, pm], 0).astype("<f4")
+        rgb = np.concatenate([cq, cm], 0).astype("u1")
+        tag = "ACCEPT" if passed else "REJECT"
+        fn = (f"coloc_{idx:02d}_{tag}_c{coloc:.3f}_"
+              f"q{cand.query_base}+{cand.query_frame}_m{cand.match_base}+{cand.match_frame}.ply")
+        path = os.path.join(self._coloc_dir, fn)
+        vert = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                         ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+        vert["x"], vert["y"], vert["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        vert["red"], vert["green"], vert["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        header = ("ply\nformat binary_little_endian 1.0\n"
+                  f"element vertex {len(vert)}\n"
+                  "property float x\nproperty float y\nproperty float z\n"
+                  "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                  "end_header\n").encode()
+        with open(path, "wb") as fh:
+            fh.write(header); fh.write(vert.tobytes())
+        print(f"[ma_slam] coloc ply -> {path} ({len(vert):,} pts: green=query red=match)")
 
     # ------------------------------------------------------------------ run
     def process_submap(self, image_paths, depth_paths):
@@ -294,6 +344,9 @@ class MaSlam:
         self._mode, self._input_K, self._depth_scale = mode, intrinsics, depth_scale
         self._depth_max = depth_max
         os.makedirs(output_dir, exist_ok=True)
+        if self.cfg["Loop"].get("debug_coloc") and self.cfg["Loop"]["enable"]:
+            self._coloc_dir = os.path.join(output_dir, "coloc")
+            os.makedirs(self._coloc_dir, exist_ok=True)
         n = len(image_paths)
         W = self.cfg["submap_size"] + self.cfg["overlap"]
         step = self.cfg["submap_size"]
