@@ -40,7 +40,7 @@ def main():
                     help="pose-graph backend + inter-submap transform group: "
                          "se3 (metric, default) | sim3 (+scale, pypose) | sl4 (projective, needs gtsam fork)")
     ap.add_argument("--out", required=True); ap.add_argument("--gt")
-    ap.add_argument("--submap_size", type=int, default=DEFAULT_CONFIG["submap_size"])
+    ap.add_argument("--submap_size", type=int, default=32)
     ap.add_argument("--no_loop", action="store_true")
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
@@ -50,6 +50,10 @@ def main():
     ap.add_argument("--debug_coloc", action="store_true",
                     help="dump each loop candidate's two re-inferred windows as a "
                          "green(query)/red(match) PLY in <out>/coloc/ for visual inspection")
+    ap.add_argument("--keyframe_disparity", type=float, default=25.0,
+                    help="LK disparity keyframe gate (pixels): drop frames whose mean optical-flow "
+                         "displacement vs the last keyframe is below this. Default 25 (on); "
+                         "0 = off (consecutive frames). submap_size then counts keyframes.")
     ap.add_argument("--voxel_size", type=float, default=DEFAULT_CONFIG["Pointcloud"]["voxel_size"])
     ap.add_argument("--max_points", type=int, default=DEFAULT_CONFIG["Pointcloud"]["max_points"],
                     help="cap on merged point-cloud size (uniform random sample); 0 = no cap")
@@ -86,6 +90,27 @@ def main():
         image_paths, depth_paths = image_paths[:n], depth_paths[:n]
     if need_intr:
         intrinsics = load_intrinsics(intr_path)
+
+    # VGGT-SLAM-style keyframe gate (opt-in): drop low-parallax frames BEFORE the pipeline,
+    # so submap_size counts keyframes (not consecutive frames). Causal → stream-compatible.
+    if a.keyframe_disparity > 0:
+        from ma_slam.keyframe_flow import select_keyframes_by_disparity
+        kf = select_keyframes_by_disparity(image_paths, a.keyframe_disparity)
+        print(f"[ma_slam] keyframe gate: kept {len(kf)}/{len(image_paths)} frames "
+              f"(disparity > {a.keyframe_disparity:g}px)")
+        image_paths = [image_paths[i] for i in kf]
+        if depth_paths is not None:
+            depth_paths = [depth_paths[i] for i in kf]
+        # subsample GT to the same keyframes so eval's per-index correspondence still holds
+        # (GT row i == original frame i; this is also how VGGT-SLAM scores ATE — on keyframes).
+        if a.gt:
+            gt_lines = [ln for ln in open(a.gt) if ln.strip() and not ln.startswith("#")]
+            os.makedirs(a.out, exist_ok=True)
+            kf_gt = os.path.join(a.out, "gt_kf.txt")
+            with open(kf_gt, "w") as f:
+                f.write("# timestamp tx ty tz qx qy qz qw\n")
+                f.write("".join(gt_lines[i] for i in kf))
+            a.gt = kf_gt
 
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["submap_size"] = a.submap_size

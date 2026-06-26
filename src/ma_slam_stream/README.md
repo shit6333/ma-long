@@ -55,7 +55,8 @@ Camera, reconstruction, and viewer all here; intrinsics come from the camera.
 |---|---|
 | `--mode {rgb, rgb+intr, rgb+depth, rgb+depth+intr}` | which inputs MapAnything uses. Depth modes are far more accurate; **use `rgb+depth+intr` with a RealSense**. |
 | `--backend {ma, da3}` | backbone: `ma` MapAnything (all modes) · `da3` DA3-nested (rgb / rgb+intr only, best rgb-only). |
-| `--submap_size` | frames per submap/chunk (default 20 ≈ 15 fps, ~15 GB VRAM). |
+| `--submap_size` | **keyframes** per submap/chunk (default **20**; counts raw frames only if `--keyframe_disparity 0`). |
+| `--keyframe_disparity` | LK optical-flow keyframe gate (px): drop low-parallax frames before accumulation so `submap_size` counts keyframes (causal, same as offline). **Default 25** (on); `0` = off (every frame). Complements the client's `--k` blur filter (sharpness) with a parallax filter. |
 | `--depth_max` | zero out depth beyond N metres before the model — **set ~6 for RealSense** (far depth is noisy). |
 | `--manifold {se3, sim3}` | pose-graph group; `se3` (metric, default) is right for RealSense depth. |
 | `--no_loop` / `--coloc_ratio` | disable / tune loop closure. |

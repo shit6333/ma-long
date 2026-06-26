@@ -17,6 +17,46 @@ which is the most developed and recommended.
 
 ---
 
+## TUM RGB-D (freiburg1) — head-to-head vs VGGT-SLAM & others
+
+Most direct external comparison. ma_slam (LK keyframe gate 25 px + `submap_size 32`, SE3) on the 9
+`freiburg1` sequences. Baselines from the VGGT-SLAM 2.0 paper Table I (Sim3-aligned ATE RMSE, m). Rows
+split **Uncalibrated (RGB-only)** vs **Calibrated** exactly as that table does — our `+intr` /
+`+depth+intr` configs feed intrinsics (and depth), i.e. **more input than the RGB-only methods**, so
+they sit in the Calibrated group and are *not* a like-for-like comparison with VGGT-SLAM.
+
+| method | 360 | desk | desk2 | floor | plant | room | rpy | teddy | xyz | **avg** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| *— Uncalibrated (RGB-only) —* | | | | | | | | | | |
+| MASt3R-SLAM\* | 0.070 | 0.035 | 0.055 | 0.056 | 0.035 | 0.118 | 0.041 | 0.114 | 0.020 | 0.060 |
+| ViSTA-SLAM | 0.104 | 0.030 | 0.030 | 0.070 | 0.052 | 0.067 | 0.023 | 0.080 | 0.015 | 0.052 |
+| VGGT-SLAM Sim(3) | 0.123 | 0.040 | 0.055 | 0.254 | 0.022 | 0.088 | 0.041 | 0.032 | 0.016 | 0.075 |
+| VGGT-SLAM SL(4) | 0.071 | 0.025 | 0.040 | 0.141 | 0.023 | 0.102 | 0.030 | 0.034 | 0.014 | 0.053 |
+| VGGT-SLAM 2.0 | 0.050 | 0.025 | 0.029 | 0.102 | 0.026 | 0.063 | 0.026 | 0.038 | 0.014 | **0.041** |
+| **ours DA3-rgb** | 0.118 | 0.033 | 0.028 | 0.115 | 0.044 | 0.045 | 0.025 | 0.047 | 0.011 | **0.052** |
+| **ours MA-rgb** | 0.091 | 0.054 | 0.060 | 0.075 | 0.054 | 0.097 | 0.042 | 0.078 | 0.030 | 0.064 |
+| *— Calibrated (intrinsics / depth — more input) —* | | | | | | | | | | |
+| MASt3R-SLAM | 0.049 | 0.016 | 0.024 | 0.025 | 0.020 | 0.061 | 0.027 | 0.041 | 0.009 | **0.030** |
+| GO-SLAM | 0.089 | 0.016 | 0.028 | 0.025 | 0.026 | 0.052 | 0.019 | 0.048 | 0.010 | 0.035 |
+| DROID-SLAM | 0.111 | 0.018 | 0.042 | 0.021 | 0.016 | 0.049 | 0.026 | 0.048 | 0.012 | 0.038 |
+| **ours MA-rgb+intr** | 0.074 | 0.029 | 0.040 | 0.058 | 0.067 | 0.084 | 0.029 | 0.064 | 0.016 | 0.051 |
+| **ours MA-rgb+depth+intr** | 0.082 | 0.026 | 0.032 | 0.036 | 0.030 | 0.063 | 0.024 | 0.039 | 0.014 | **0.038** |
+
+**Setup:** distorted (raw, no undistort) input; keyframe gate 25 px → `submap_size 32` counts 32
+keyframes (= VGGT-SLAM's `w`); Sim3-ATE (their protocol). SE3-avg (metric): MA-rgb 0.220 · DA3-rgb
+0.103 · MA-rgb+intr 0.305 · **MA-rgb+depth+intr 0.042**.
+
+**Findings:**
+- **RGB-only:** `DA3-rgb` **0.052 ≈ VGGT-SLAM SL(4) (0.053)**, and beats VGGT-SLAM Sim(3), ViSTA, MASt3R\* —
+  a metric backbone + plain **SE(3)** matches the 15-DoF SL(4) projective alignment. Behind VGGT-SLAM 2.0 (0.041).
+- **With depth:** `MA-rgb+depth+intr` **0.038 < VGGT-SLAM 2.0 (0.041)** and is metrically consistent
+  (SE3 ≈ Sim3, scale ≈ 1.0). Among *calibrated* methods it's competitive (ties DROID 0.038; behind MASt3R-SLAM 0.030).
+- **Depth — not intrinsics — anchors scale:** `+intr` alone improves trajectory shape (Sim3 0.051) but
+  *worsens* the metric (SE3 0.305, scale 0.6–0.9); only depth fixes it (SE3 0.042). Judge these with SE3.
+- **Weak spot = `360`** (pure rotation → no triangulation baseline) across all configs — an inherent backbone limit.
+
+---
+
 ## TL;DR
 
 1. **`ma_slam` (online) matches or beats the offline pipeline** in depth modes, with **stable**

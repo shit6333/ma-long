@@ -36,11 +36,13 @@ import time
 # make the src/ sibling packages (model, ma_slam, align, ...) importable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import cv2
 import numpy as np
 import torch
 
 from model.inputs import MODES, load_intrinsics
 from ma_slam.solver import MaSlam, DEFAULT_CONFIG
+from ma_slam.keyframe_flow import DisparityKeyframer
 from ma_slam_stream.sources import make_source
 from ma_slam_stream.realsense import add_capture_args, capture_from_args
 from ma_slam_stream.viz import make_viz
@@ -83,14 +85,23 @@ def _finalize(slam, out, n, elapsed, fps, vram, mode):
 
 
 def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, dump_every,
-                viz=None):
-    """Accumulate live frames into submaps and feed them to slam.process_submap."""
+                viz=None, keyframe_disparity=0.0):
+    """Accumulate live frames into submaps and feed them to slam.process_submap.
+
+    With ``keyframe_disparity > 0`` a causal LK optical-flow gate runs per arriving frame
+    (same ``DisparityKeyframer`` as the offline path): low-parallax frames are dropped before
+    accumulation, so ``submap_size`` counts keyframes. Non-keyframes are still fed to the gate
+    (to track displacement) but never enter a submap."""
     # the solver caches these on the instance (offline run() sets them the same way).
     slam._mode, slam._input_K, slam._depth_scale, slam._depth_max = (
         mode, intrinsics, depth_scale, depth_max)
     want_depth = "depth" in mode
     size = slam.cfg["submap_size"]
     overlap = slam.cfg["overlap"]
+    keyframer = DisparityKeyframer(keyframe_disparity) if keyframe_disparity > 0 else None
+    if keyframer is not None:
+        print(f"[ma_slam] keyframe gate ON: disparity > {keyframe_disparity:g}px "
+              f"(submap_size counts keyframes)")
 
     _ = slam.model                                # force model load before timing
     cuda = torch.cuda.is_available()
@@ -121,6 +132,10 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
         for frame in source:                      # blocks until next frame / stop sentinel
             if frame is None:
                 break
+            if keyframer is not None:              # causal LK gate: drop low-parallax frames
+                img = cv2.imread(frame[0], cv2.IMREAD_COLOR)
+                if img is None or not keyframer.step(img):
+                    continue
             buf.append(frame)
             n_frames += 1
             if len(buf) >= size:
@@ -161,7 +176,10 @@ def main():
     ap.add_argument("--intrinsic",
                     help="K file; omit for 'local' (taken from the camera) or 'zmq' (META)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--submap_size", type=int, default=DEFAULT_CONFIG["submap_size"])
+    ap.add_argument("--submap_size", type=int, default=20)
+    ap.add_argument("--keyframe_disparity", type=float, default=25.0,
+                    help="LK optical-flow keyframe gate (px): drop low-parallax frames before "
+                         "accumulation; submap_size then counts keyframes. Default 25; 0 = off (every frame)")
     ap.add_argument("--no_loop", action="store_true")
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
@@ -232,7 +250,7 @@ def main():
     res = stream_loop(slam, source, a.out, mode=a.mode, intrinsics=intrinsics,
                       depth_scale=depth_scale,
                       depth_max=(a.depth_max if a.depth_max > 0 else None),
-                      dump_every=a.dump_every, viz=viz)
+                      dump_every=a.dump_every, viz=viz, keyframe_disparity=a.keyframe_disparity)
     print(f"[ma_slam] stream done: submaps={res['n_submaps']} loops={res['n_loops']} "
           f"fps={res['fps']:.2f} -> {res['poses_txt']}")
 

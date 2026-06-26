@@ -42,13 +42,14 @@ is a one-time manual download to `src/weights/dino_salad.ckpt` — see [INSTALL.
 # ma_slam (recommended online) — ScanNet-style scene dir (rgb/, depth/, intrinsic.txt, gt_pose.txt)
 python src/ma_slam/run.py \
     --scene example_data/scene0378_00 --mode rgb+depth+intr \
-    --out outputs/maslam_s0378 --gt example_data/scene0378_00/gt_pose.txt --submap_size 20
+    --out outputs/maslam_s0378 --gt example_data/scene0378_00/gt_pose.txt \
+    --keyframe_disparity 25 --submap_size 32
 
-# ma_slam with the DA3 backbone — metric reconstruction from RGB alone (best for rgb-only /
-# unreliable-depth data; --backend da3 supports rgb / rgb+intr, no depth input)
+# ma_slam with the DA3 backbone — metric reconstruction from RGB alone (best for rgb-only)
 python src/ma_slam/run.py \
     --scene example_data/scene0378_00 --mode rgb --backend da3 \
-    --out outputs/maslam_da3_s0378 --gt example_data/scene0378_00/gt_pose.txt --submap_size 20
+    --out outputs/maslam_da3_s0378 --gt example_data/scene0378_00/gt_pose.txt \
+    --keyframe_disparity 25 --submap_size 32
 
 # offline chunk pipeline
 python src/ma_long/run.py \
@@ -124,8 +125,9 @@ one row per frame), `combined_pcd.ply`, and `run_stats.txt`/`loops.txt` (fps, VR
 
 | group | key | default | meaning |
 |---|---|---|---|
-| chunking | `submap_size` | 16 (eval uses **20**) | new frames per submap (submap = `submap_size + overlap`). Bigger → fewer seams but ~linear VRAM ↑; fps ~flat. cs20 is the sweet spot. |
+| chunking | `submap_size` | 16 (eval uses **20**; **32** with keyframe gate) | new frames (or **keyframes**, if `--keyframe_disparity>0`) per submap (submap = `submap_size + overlap`). Bigger → fewer seams but ~linear VRAM ↑; fps ~flat. |
 | | `overlap` | 1 | shared frame between submaps (only 1 supported) |
+| keyframe | `keyframe_disparity` | 0 = off (**25** recommended) | `--keyframe_disparity <px>`: LK optical-flow keyframe gate ([`keyframe_flow.py`](src/ma_slam/keyframe_flow.py)) — keep a frame only when its mean feature displacement vs the last keyframe exceeds `<px>`; low-parallax frames are dropped before the backbone, so `submap_size` then counts **keyframes**. 0 = consecutive frames. Lifts parallax-starved scenes (TUM `room` 0.150→0.045). |
 | graph | `manifold` | `se3` | gtsam `Pose3` backend (metric). Seam for Sim3/SL4. |
 | | `inner_sigma` / `intra_sigma` | 0.03 / 0.05 | odometry (intra-submap / overlap-tie) noise — trusted, tight |
 | | `loop_sigma` | 0.10 | loop constraint noise (looser = less trusted) |
@@ -140,9 +142,9 @@ one row per frame), `combined_pcd.ply`, and `run_stats.txt`/`loops.txt` (fps, VR
 | | `max_points` | 2,000,000 | cap merged cloud (uniform random sample); `0` = no cap |
 | | `voxel_size` | 0.0 | optional voxel downsample (m) |
 
-**CLI overrides** (`src/ma_slam/run.py`): `--submap_size --no_loop --sim_threshold
---coloc_ratio --loop_half_window --debug_coloc --voxel_size --max_points --conf_coef
---depth_scale --depth_max --max_frames --device`.
+**CLI overrides** (`src/ma_slam/run.py`): `--submap_size --keyframe_disparity --no_loop
+--sim_threshold --coloc_ratio --loop_half_window --debug_coloc --voxel_size --max_points
+--conf_coef --depth_scale --depth_max --max_frames --device`.
 
 ### Real-sensor depth (RealSense etc.) → use `--depth_max`
 MapAnything **keeps the depth you give it** (output ≈ input to ~1 cm on provided pixels;
@@ -169,21 +171,11 @@ CLI: `--init_window --step --kf_threshold --no_loop --loop_dist`.
 
 ---
 
-## Results (Sim3-ATE m; ma_slam submap_size 20, current defaults)
+## Results
 
-| scene (frames) | rgb | +depth | +depth+intr | offline pipeline +d+i |
-|---|---|---|---|---|
-| s0011 (238) | 0.150 | 0.069 | **0.059** | 0.081 |
-| s0378 (190) | 0.098 | 0.051 | 0.055 | 0.054 |
-| s0231 (444) | 0.140 | 0.106 | **0.099** | 0.131 (best prior) |
-
-- In depth modes, **ma_slam (online) matches or beats the offline pipeline**.
-- On s0231 (loopy), ma_slam's loop closure is **stable & helpful** (cuts ATE), where the older
-  AMB3R online LC *degraded* it (0.131 → 0.30).
-- **Perf:** ~15.5 fps, ~15 GB VRAM (RTX PRO 6000, submap_size 20).
-
-**Full results + ablations** (DA3-vs-MapAnything, loop-closure tuning, submap-size sweep,
-RealSense `--depth_max`, …) → **[docs/RESULTS.md](docs/RESULTS.md)**.
+TUM RGB-D head-to-head vs VGGT-SLAM 1.0/2.0, MASt3R-SLAM, DROID-SLAM, … plus all ablations
+(DA3-vs-MapAnything, depth/intrinsics, loop-closure tuning, submap-size sweep, RealSense
+`--depth_max`, …) → **[docs/RESULTS.md](docs/RESULTS.md)**.
 
 ---
 
