@@ -2,7 +2,7 @@
 
 Long-sequence reconstruction on the **MapAnything** backbone (with an optional **DA3** backbone).
 Three front-ends share one chunk model + one eval: the **offline chunk pipeline** (`ma_long`), the
-AMB3R-style **fused online SLAM** (`ma_long/slam.py`), and **`ma_slam`** — the VGGT-SLAM-2.0-style
+AMB3R-style **fused online SLAM** (`ma_long/slam.py`), and **`ma_slam`** — the VGGT-SLAM-style
 online system (submaps → SE3 gtsam factor graph → incremental global re-opt → robust loop closure),
 which is the most developed and recommended.
 
@@ -245,6 +245,17 @@ Tested end-to-end (rgb, submap_size 20, Sim3-ATE / SE3-ATE / scale):
 across the chain. A per-pair scale correction can fit the overlap better locally yet still degrade
 the *global* trajectory once accumulated. Conclusion: for a metric backbone (DA3 always; MA with
 depth) keep `--manifold se3`. The flag is retained for experimentation, but Sim3 is a loss here.
+
+**Update — TUM fr1 (keyframe gate 25 px + `submap_size 32`, distorted, avg over 9 seq).** With the
+keyframe config the effect splits by backbone:
+
+| backbone (rgb) | SE3 — Sim3-ATE / SE3-ATE | Sim3 — Sim3-ATE / SE3-ATE |
+|---|---|---|
+| DA3-rgb | 0.052 / 0.103 | 0.052 / **0.087** |
+| MA-rgb  | **0.064 / 0.220** | 0.083 / 0.284 |
+
+**DA3-rgb improves** on metric SE3-ATE (0.103 → 0.087, trajectory shape unchanged); **MA-rgb degrades**
+on both. `--manifold se3` stays the default; Sim3 only helps the metric of a reliable RGB backbone (DA3).
 
 > Implementation note: the loop edge fed to `Sim3LoopOptimizer` must be `inv(T_ab)` — its edge
 > `(i,j)` constraint is the reverse of gtsam's `BetweenFactor` convention `inv(P_a)@P_b`. Storing it

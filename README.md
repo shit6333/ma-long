@@ -15,7 +15,7 @@ Three interchangeable front-ends share one backbone (`MaChunkModel`) and one eva
 |---|---|---|---|
 | **chunk pipeline** | `src/ma_long/pipeline.py` (`run.py`) | offline: overlapping chunks → SE3 align → batch loop closure | best raw accuracy, whole sequence available |
 | **AMB3R online** | `src/ma_long/slam.py` (`run_slam.py`) | online: persistent confidence-fused map + keyframes | streaming, fused dense map |
-| **ma_slam** ⭐ | `src/ma_slam/` (`src/ma_slam/run.py`) | **online, VGGT-SLAM-2.0-style**: submaps → SE3 factor graph (gtsam) → incremental global re-opt → stable loop closure | **recommended online**; metric, robust LC |
+| **ma_slam** ⭐ | `src/ma_slam/` (`src/ma_slam/run.py`) | **online, VGGT-SLAM-style**: submaps → SE3 factor graph (gtsam) → incremental global re-opt → stable loop closure | **recommended online**; metric, robust LC |
 
 > **ma_slam** is the most developed and is recommended for online use: it matches or beats
 > the offline pipeline in depth modes while running at ~15.5 fps, with **stable** loop closure
@@ -128,7 +128,7 @@ one row per frame), `combined_pcd.ply`, and `run_stats.txt`/`loops.txt` (fps, VR
 | chunking | `submap_size` | 16 (eval uses **20**; **32** with keyframe gate) | new frames (or **keyframes**, if `--keyframe_disparity>0`) per submap (submap = `submap_size + overlap`). Bigger → fewer seams but ~linear VRAM ↑; fps ~flat. |
 | | `overlap` | 1 | shared frame between submaps (only 1 supported) |
 | keyframe | `keyframe_disparity` | 0 = off (**25** recommended) | `--keyframe_disparity <px>`: LK optical-flow keyframe gate ([`keyframe_flow.py`](src/ma_slam/keyframe_flow.py)) — keep a frame only when its mean feature displacement vs the last keyframe exceeds `<px>`; low-parallax frames are dropped before the backbone, so `submap_size` then counts **keyframes**. 0 = consecutive frames. Lifts parallax-starved scenes (TUM `room` 0.150→0.045). |
-| graph | `manifold` | `se3` | gtsam `Pose3` backend (metric). Seam for Sim3/SL4. |
+| graph | `manifold` | `se3` | gtsam `Pose3` backend (metric). `--manifold sim3` carries inter-submap scale — **only worth it with `--backend da3`** (improves DA3-rgb metric SE3-ATE; worsens MA-rgb). |
 | | `inner_sigma` / `intra_sigma` | 0.03 / 0.05 | odometry (intra-submap / overlap-tie) noise — trusted, tight |
 | | `loop_sigma` | 0.10 | loop constraint noise (looser = less trusted) |
 | | `loop_robust` / `_k` | **`huber` / 1.345** | **robust kernel on loop factors only** — auto-downweights a wrong loop (free insurance: neutral on clean loops; a gross false loop → traj err 0.17 vs 3.57 plain) |
@@ -186,7 +186,7 @@ TUM RGB-D head-to-head vs VGGT-SLAM 1.0/2.0, MASt3R-SLAM, DROID-SLAM, … plus a
 
 ```
 src/
-  ma_slam/      VGGT-SLAM-style online SLAM (run.py, solver/graph/submap/map/loop)
+  ma_slam/      feedforward online SLAM — submaps → SE3 factor graph → loop closure (run.py, solver/graph/submap/map/loop)
   ma_long/      offline chunk pipeline (pipeline.py/run.py) + AMB3R online (slam.py/run_slam.py) + tools/ configs/
   model/        MaChunkModel (MapAnything) + Da3ChunkModel (DA3) + multi-modal input assembly  [shared]
   align/        SE3/Sim3 geometry + robust IRLS alignment   [shared; pulls in fastloop/]
@@ -212,7 +212,7 @@ Built on / inspired by these excellent projects:
 
 - **[MapAnything](https://github.com/facebookresearch/map-anything)** — metric multi-view foundation model (default backbone).
 - **[Depth-Anything-3](https://github.com/bytedance-seed/depth-anything-3)** — metric depth + pose from RGB (the `--backend da3` backbone).
-- **[VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM)** — the submap + factor-graph SLAM design `ma_slam` is built on (VGGT-SLAM-2.0-style).
+- **[VGGT-SLAM](https://github.com/MIT-SPARK/VGGT-SLAM)** — the submap + factor-graph SLAM design `ma_slam` is built on.
 - **[VGGT-Long](https://github.com/DengKaiCQ/VGGT-Long)** — long-sequence chunk + loop-closure pipeline (architectural blueprint; SALAD loop detector).
 - **[AMB3R](https://github.com/HengyiWang/amb3r)** — fused-map online SLAM (the AMB3R-style front-end).
 - **[SALAD](https://github.com/serizba/salad)** — DINOv2-SALAD visual place recognition (the `dino_salad.ckpt` loop-closure checkpoint).
