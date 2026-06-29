@@ -21,9 +21,13 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ## 2. MapAnything backbone (default `--backend ma`)
 
+Install MapAnything from a source clone under `thirdparty/` (create the dir first):
+
 ```bash
-pip install mapanything==1.1.2     # pulls uniception==0.1.7, hydra-core, huggingface-hub, einops, opencv-python-headless
-pip install timm==1.0.27           # DINOv2 backbone (keep 1.0.x)
+mkdir -p thirdparty
+git clone https://github.com/facebookresearch/map-anything thirdparty/map-anything
+pip install -e thirdparty/map-anything   # pulls uniception==0.1.7, hydra-core, huggingface-hub, einops, opencv-python-headless
+pip install timm==1.0.27                 # DINOv2 backbone (keep 1.0.x)
 ```
 Model weights auto-download from HuggingFace on first run (`facebook/map-anything`).
 
@@ -78,9 +82,9 @@ git clone https://github.com/ByteDance-Seed/Depth-Anything-3 thirdparty/Depth-An
 ```
 DA3 weights auto-download on first run (see table above); `gsplat` (3DGS export) is not used here.
 
-> `thirdparty/` is git-ignored — it holds external repos cloned separately. MapAnything is used
-> via its **pip package** (step 2), so `thirdparty/map-anything` is not required. `VGGT-SLAM` /
-> `VGGT-Long` are reference blueprints only (not imported at runtime).
+> `thirdparty/` is git-ignored — it holds external repos cloned separately. Both backbones install
+> from source clones under it (MapAnything step 2, DA3 step 6). `VGGT-SLAM` / `VGGT-Long` are
+> reference blueprints only (not imported at runtime).
 
 ---
 
