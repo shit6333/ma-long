@@ -73,9 +73,12 @@ Camera, reconstruction, and viewer all here; intrinsics come from the camera.
 | `--viz_addr` | `[viz connect]` running viewer url, e.g. `rr+http://LAPTOP_IP:9876`. |
 | `--dump_every N` | write intermediate poses every N submaps (live preview file). |
 
-**RealSense capture** (`local` source / the client): `--enable_ir`, `--no_emitter`,
-`--laser_power`, `--no_postprocess` (the official threshold→spatial→temporal→hole-filling depth
-filter chain is on by default), `--rs_depth_max` (sensor-side range clip). `--width/--height/--fps`.
+**RealSense capture** (`local` source / the client) — defaults match a validated D4xx config:
+capture **848×480**, depth `visual_preset` **Medium Density**, **spatial + temporal** filters on
+(decimation + hole-filling off), range **0.2–4.0 m**, then **center-crop to 640×480** for SLAM
+(crop keeps fx/fy, only shifts cx/cy; `K` is adjusted automatically). Override with `--preset`,
+`--no_spatial` / `--no_temporal` / `--hole` / `--decimation`, `--spatial_alpha/…`, `--rs_depth_max`,
+`--out_width/--out_height` (0 = keep native), `--enable_ir`, `--no_emitter`, `--laser_power`.
 
 Stream to a rerun viewer already running on your laptop (laptop: run `rerun` first):
 ```bash
