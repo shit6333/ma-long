@@ -34,9 +34,9 @@ import numpy as np
 # allow running both as `python client.py` (copied next to realsense.py) and `-m ma_slam_stream.client`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from realsense import add_capture_args, capture_from_args, blur_select
+    from realsense import add_capture_args, capture_from_args, select_stream
 except ImportError:
-    from ma_slam_stream.realsense import add_capture_args, capture_from_args, blur_select
+    from ma_slam_stream.realsense import add_capture_args, capture_from_args, select_stream
 
 
 class ZmqSender:
@@ -133,10 +133,10 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: running.__setitem__("go", False))
 
     sent = 0
-    print(f"[client] capturing (k={a.k}, ir={a.enable_ir}, postprocess={not a.no_postprocess}); "
-          f"Ctrl+C to stop")
+    print(f"[client] capturing (k={a.k}, keyframe_disparity={a.keyframe_disparity}, "
+          f"ir={a.enable_ir}); Ctrl+C to stop")
     try:
-        for f in blur_select(cap.frames(), a.k):
+        for f in select_stream(cap, a.k, a.keyframe_disparity):
             if not running["go"]:
                 break
             ok, rgb_buf = cv2.imencode(".jpg", f["bgr"], [cv2.IMWRITE_JPEG_QUALITY, a.jpeg_quality])

@@ -246,6 +246,63 @@ def blur_select(frames: Iterator[Dict], k: int) -> Iterator[Dict]:
             best, win = None, 0
 
 
+# ------------------------------------------------------- keyframe gate (LK disparity)
+# Standalone mirror of ``ma_slam/keyframe_flow.py`` so realsense.py + client.py stay
+# copy-to-laptop with no repo imports. VGGT-SLAM-style: promote a frame to a keyframe when
+# the mean LK optical-flow displacement of tracked corners vs the last keyframe exceeds
+# ``min_disparity`` px — drops redundant low-parallax frames. Causal → streaming-safe.
+_KF_MAX_CORNERS, _KF_QUALITY, _KF_MIN_DIST, _KF_BLOCK, _KF_MIN_TRACKED = 1000, 0.01, 8, 7, 10
+_KF_LK = dict(winSize=(21, 21), maxLevel=3,
+              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+
+class DisparityKeyframer:
+    """Stateful, causal LK-disparity keyframe selector; ``step(bgr)`` True iff keyframe."""
+
+    def __init__(self, min_disparity: float = 25.0):
+        self.min_disp = float(min_disparity)
+        self.kf_gray: Optional[np.ndarray] = None
+        self.kf_pts: Optional[np.ndarray] = None
+
+    def _reinit(self, gray):
+        self.kf_gray = gray
+        self.kf_pts = cv2.goodFeaturesToTrack(gray, _KF_MAX_CORNERS, _KF_QUALITY,
+                                              _KF_MIN_DIST, blockSize=_KF_BLOCK)
+
+    def step(self, bgr: np.ndarray) -> bool:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if self.kf_pts is None or len(self.kf_pts) < _KF_MIN_TRACKED:
+            self._reinit(gray)
+            return True
+        nxt, st, _ = cv2.calcOpticalFlowPyrLK(self.kf_gray, gray, self.kf_pts, None, **_KF_LK)
+        st = st.flatten()
+        good_kf, good_nxt = self.kf_pts[st == 1], nxt[st == 1]
+        if len(good_kf) < _KF_MIN_TRACKED:
+            self._reinit(gray)
+            return True
+        mean_disp = float(np.mean(np.linalg.norm(good_nxt - good_kf, axis=1)))
+        if mean_disp > self.min_disp:
+            self._reinit(gray)           # select + re-anchor onto this frame
+            return True
+        return False
+
+
+def disparity_gate(frames: Iterator[Dict], min_disparity: float) -> Iterator[Dict]:
+    """Yield only keyframes from a capture-dict iterator. ``min_disparity <= 0`` -> gate off."""
+    if min_disparity <= 0:
+        yield from frames
+        return
+    kf = DisparityKeyframer(min_disparity)
+    for f in frames:
+        if kf.step(f["bgr"]):
+            yield f
+
+
+def select_stream(cap, k: int, keyframe_disparity: float) -> Iterator[Dict]:
+    """Producer selection pipeline: blur-select (sharpest of k) then LK keyframe gate."""
+    return disparity_gate(blur_select(cap.frames(), k), keyframe_disparity)
+
+
 # ---------------------------------------------------------------------- shared CLI args
 def add_capture_args(ap: argparse.ArgumentParser):
     """RealSense capture flags shared by the local source (run_stream) and the laptop client.
@@ -262,6 +319,10 @@ def add_capture_args(ap: argparse.ArgumentParser):
     g.add_argument("--fps", type=int, default=30)
     g.add_argument("--k", type=int, default=3,
                    help="blur window: keep the sharpest of every k frames (1 = every frame)")
+    g.add_argument("--keyframe_disparity", type=float, default=25.0,
+                   help="LK keyframe gate (px): drop frames whose mean optical-flow displacement "
+                        "vs the last keyframe is below this. Default 25 (on, follows ma_slam); "
+                        "0 = off. Runs after blur-select; submap_size then counts keyframes.")
     g.add_argument("--preset", default="Medium Density",
                    help="depth visual_preset (e.g. 'Medium Density', 'High Accuracy', 'High Density')")
     g.add_argument("--enable_ir", action="store_true",

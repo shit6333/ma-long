@@ -79,6 +79,8 @@ capture **848×480**, depth `visual_preset` **Medium Density**, **spatial + temp
 (crop keeps fx/fy, only shifts cx/cy; `K` is adjusted automatically). Override with `--preset`,
 `--no_spatial` / `--no_temporal` / `--hole` / `--decimation`, `--spatial_alpha/…`, `--rs_depth_max`,
 `--out_width/--out_height` (0 = keep native), `--enable_ir`, `--no_emitter`, `--laser_power`.
+Frame selection: `--k` (blur window) and `--keyframe_disparity` (LK keyframe gate, default 25 px
+on; 0 = off).
 
 Stream to a rerun viewer already running on your laptop (laptop: run `rerun` first):
 ```bash
@@ -91,16 +93,19 @@ server); `--viz web` needs only a browser.
 ## 5. Streaming pipeline
 
 ```
-RealSense ─► blur-select (sharpest of k) ─► transport (zmq / folder / in-process)
-          ─► server: accumulate submap_size frames ─► ma_slam.process_submap
+RealSense ─► blur-select (sharpest of k) ─► LK keyframe gate (disparity) ─► transport
+          ─► server: accumulate submap_size keyframes ─► ma_slam.process_submap
              (reconstruct chunk → place via shared overlap frame → global PGO → loop closure)
           ─► [--viz] log new points + trajectory to rerun
 ```
 
-- **Blur selection** runs on the producer (laptop for `zmq`/`folder`, in-process for `local`):
-  Laplacian-variance sharpness, sent as JPEG (rgb) + 16-bit PNG (depth in mm → server
-  `depth_scale=1000`). Larger `k` removes blur but widens the baseline within a submap and can
-  hurt reconstruction — keep it small.
+- **Frame selection** runs on the producer (laptop for `zmq`/`folder`, in-process for `local`),
+  in two stages: **(1) blur-select** — Laplacian-variance sharpest of every `k`; **(2) LK
+  keyframe gate** (`--keyframe_disparity`, default 25 px, on — follows `ma_slam`) drops
+  low-parallax frames so `submap_size` counts genuine keyframes. A near-static camera then sends
+  almost nothing. Set `--keyframe_disparity 0` for the old every-frame behaviour. Selected frames
+  go as JPEG (rgb) + 16-bit PNG (depth in mm → server `depth_scale=1000`). Larger `k` removes
+  blur but widens the baseline — keep it small.
 - **Submap accumulation** carries each submap's last frame as the next submap's first (shared
   overlap), exactly like the offline windowing; this anchors each new submap to the global map.
 - **Reconstruction / loop closure** is unchanged `ma_slam` — global pose-graph re-optimized after
