@@ -103,7 +103,10 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
         print(f"[ma_slam] keyframe gate ON: disparity > {keyframe_disparity:g}px "
               f"(submap_size counts keyframes)")
 
+    print("[ma_slam] loading model...")
     _ = slam.model                                # force model load before timing
+    print("\n[ma_slam] ===== READY — model loaded, viewer served. "
+          "Start/allow the client to stream now. =====\n")
     cuda = torch.cuda.is_available()
     if cuda:
         torch.cuda.reset_peak_memory_stats()
@@ -225,8 +228,7 @@ def main():
     live_dir = os.path.join(a.out, "live")
     capture = capture_from_args(a, need_depth) if a.source == "local" else None
     source = make_source(a.source, live_dir=live_dir, want_depth=need_depth, bind=a.bind,
-                         watch_dir=a.watch_dir, poll=a.poll, capture=capture, k=a.k,
-                         keyframe_disparity=a.keyframe_disparity)
+                         watch_dir=a.watch_dir, poll=a.poll, capture=capture, k=a.k)
 
     # intrinsics: CLI file wins; otherwise (intr mode) take from the source (local camera / zmq META).
     intrinsics = load_intrinsics(a.intrinsic) if a.intrinsic else None

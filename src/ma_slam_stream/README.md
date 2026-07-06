@@ -27,27 +27,43 @@ pip install pyzmq                              # for --transport zmq
 
 ## 2. How to run
 
-### Laptop → server, watch in a browser (`zmq` + `--viz web`)
-Server (listens, serves the viewer):
+**Where to run:** the **server** runs from the **repo root** with `PYTHONPATH=src` (so `--out`
+paths land at the repo root, not under `src/`). The **client** runs on the laptop from wherever
+you copied `realsense.py` + `client.py`.
+
+### Laptop → server, watch in a browser (`zmq` + `--viz web`)  ← recommended
+
+**① Server** (repo root) — binds the socket, serves the viewer, loads the model, prints `READY`:
 ```bash
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python -m ma_slam_stream.run_stream \
     --source zmq --bind 'tcp://*:5599' --mode rgb+depth+intr --depth_max 6 \
     --out outputs/maslam_live --submap_size 20 --viz web
 ```
-Laptop (push frames; replace `SERVER_IP`):
+
+**② Client** (laptop) — sends intrinsics, then **waits at a `press ENTER` prompt** (it does NOT
+stream yet):
 ```bash
-python client.py --transport zmq --addr tcp://SERVER_IP:5599 --mode rgb+depth+intr --k 3
+cd src/ma_slam_stream
+python client.py --transport zmq --addr tcp://SERVER_IP:5599 --mode rgb+depth+intr
 ```
-Open the URL the server prints in any browser. Stop the laptop with Ctrl+C — outputs flush
-automatically. (The laptop sends intrinsics, so the server needs no `--intrinsic`.)
+
+**③ Open the viewer** — the server prints a full URL like
+`http://<server-ip>:9090/?url=rerun%2Bhttp...`. Open **that whole URL** in a browser (the bare
+`:9090` only shows rerun's welcome screen). Wait for the server's `===== READY =====` line.
+
+**④ Start** — press **ENTER** in the client terminal → it begins streaming, reconstruction +
+point cloud appear live. **Stop** with `Ctrl+C` in the client → the server flushes outputs to
+`--out`. (Add `--auto_start` to the client to skip the ENTER handshake.)
 
 ### Everything on one machine (`local`)
 ```bash
+cd /path/to/ma_long
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python -m ma_slam_stream.run_stream \
     --source local --mode rgb+depth+intr --depth_max 6 \
     --out outputs/maslam_live --submap_size 20 --k 3 --viz spawn
 ```
-Camera, reconstruction, and viewer all here; intrinsics come from the camera.
+Camera, reconstruction, and viewer all here; intrinsics come from the camera (no `--intrinsic`,
+no client). `--viz spawn` opens a native window; use `--viz web` + the printed URL if headless.
 
 ## 3. Important args (reconstruction)
 
@@ -68,7 +84,8 @@ Camera, reconstruction, and viewer all here; intrinsics come from the camera.
 | `--source {local, zmq, folder}` | frame transport (see top). |
 | `--bind` | `[zmq]` server PULL address (default `tcp://*:5599`). |
 | `--watch_dir` | `[folder]` dir to watch (default `<out>/live/incoming`). |
-| `--k` | blur window — keep the sharpest of every `k` frames (`1` = every frame). Start at 2–4. |
+| `--k` | blur window (producer) — keep the sharpest of every `k` frames (`1` = every frame). Start at 2–4. |
+| `--keyframe_disparity` | LK keyframe gate (server) — see §3; default 25 px on, `0` = every frame. |
 | `--viz {none, spawn, web, connect}` | real-time rerun viewer: `spawn` native window here · `web` browser · `connect` a remote viewer. |
 | `--viz_addr` | `[viz connect]` running viewer url, e.g. `rr+http://LAPTOP_IP:9876`. |
 | `--dump_every N` | write intermediate poses every N submaps (live preview file). |
@@ -78,9 +95,7 @@ capture **848×480**, depth `visual_preset` **Medium Density**, **spatial + temp
 (decimation + hole-filling off), range **0.2–4.0 m**, then **center-crop to 640×480** for SLAM
 (crop keeps fx/fy, only shifts cx/cy; `K` is adjusted automatically). Override with `--preset`,
 `--no_spatial` / `--no_temporal` / `--hole` / `--decimation`, `--spatial_alpha/…`, `--rs_depth_max`,
-`--out_width/--out_height` (0 = keep native), `--enable_ir`, `--no_emitter`, `--laser_power`.
-Frame selection: `--k` (blur window) and `--keyframe_disparity` (LK keyframe gate, default 25 px
-on; 0 = off).
+`--out_width/--out_height` (0 = keep native), `--enable_ir`, `--no_emitter`, `--laser_power`, `--k`.
 
 Stream to a rerun viewer already running on your laptop (laptop: run `rerun` first):
 ```bash
@@ -93,19 +108,21 @@ server); `--viz web` needs only a browser.
 ## 5. Streaming pipeline
 
 ```
-RealSense ─► blur-select (sharpest of k) ─► LK keyframe gate (disparity) ─► transport
-          ─► server: accumulate submap_size keyframes ─► ma_slam.process_submap
-             (reconstruct chunk → place via shared overlap frame → global PGO → loop closure)
+producer: RealSense ─► blur-select (sharpest of k) ─► transport (zmq / folder / in-process)
+server:   LK keyframe gate (disparity) ─► accumulate submap_size keyframes ─► ma_slam.process_submap
+          (reconstruct chunk → place via shared overlap frame → global PGO → loop closure)
           ─► [--viz] log new points + trajectory to rerun
 ```
 
-- **Frame selection** runs on the producer (laptop for `zmq`/`folder`, in-process for `local`),
-  in two stages: **(1) blur-select** — Laplacian-variance sharpest of every `k`; **(2) LK
-  keyframe gate** (`--keyframe_disparity`, default 25 px, on — follows `ma_slam`) drops
-  low-parallax frames so `submap_size` counts genuine keyframes. A near-static camera then sends
-  almost nothing. Set `--keyframe_disparity 0` for the old every-frame behaviour. Selected frames
-  go as JPEG (rgb) + 16-bit PNG (depth in mm → server `depth_scale=1000`). Larger `k` removes
-  blur but widens the baseline — keep it small.
+- **Frame selection is two stages, in two places.** **(1) Blur-select** (`--k`) runs on the
+  *producer* (laptop for `zmq`/`folder`, in-process for `local`): Laplacian-variance sharpest of
+  every `k`, sent as JPEG (rgb) + 16-bit PNG (depth in mm → server `depth_scale=1000`).
+  **(2) LK keyframe gate** (`--keyframe_disparity`, default 25 px, on — same
+  `DisparityKeyframer` as offline `ma_slam`) runs on the *server*, dropping low-parallax frames
+  before accumulation so `submap_size` counts genuine keyframes. Set `--keyframe_disparity 0` for
+  every-frame behaviour. (Gating server-side keeps it uniform across transports; the cost is that
+  `zmq`/`folder` still transmit every blur-selected frame — move the gate to the client if
+  bandwidth matters.) Larger `k` removes blur but widens the baseline — keep it small.
 - **Submap accumulation** carries each submap's last frame as the next submap's first (shared
   overlap), exactly like the offline windowing; this anchors each new submap to the global map.
 - **Reconstruction / loop closure** is unchanged `ma_slam` — global pose-graph re-optimized after

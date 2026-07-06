@@ -34,9 +34,9 @@ import numpy as np
 # allow running both as `python client.py` (copied next to realsense.py) and `-m ma_slam_stream.client`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from realsense import add_capture_args, capture_from_args, select_stream
+    from realsense import add_capture_args, capture_from_args, blur_select
 except ImportError:
-    from ma_slam_stream.realsense import add_capture_args, capture_from_args, select_stream
+    from ma_slam_stream.realsense import add_capture_args, capture_from_args, blur_select
 
 
 class ZmqSender:
@@ -108,6 +108,8 @@ def main():
     ap.add_argument("--jpeg_quality", type=int, default=90)
     ap.add_argument("--max_frames", type=int, default=0,
                     help="stop after sending this many selected frames (0 = until Ctrl+C)")
+    ap.add_argument("--auto_start", action="store_true",
+                    help="skip the 'press ENTER' handshake and start streaming immediately")
     add_capture_args(ap)                          # --width/--height/--fps/--k/--enable_ir/...
     a = ap.parse_args()
 
@@ -125,18 +127,27 @@ def main():
     cap.start()
     if want_intr:
         ci = cap.K
-        sender.send_meta(cap.K, cap.depth_scale)
+        sender.send_meta(cap.K, cap.depth_scale)          # send intrinsics FIRST (server needs them)
         print(f"[client] intrinsics fx={ci[0,0]:.1f} fy={ci[1,1]:.1f} cx={ci[0,2]:.1f} "
               f"cy={ci[1,2]:.1f} | depth sent as uint16 mm (server depth_scale={cap.depth_scale})")
+
+    # Handshake: hold here until the server has loaded its model and the viz page is up, so no
+    # frames are streamed (and reconstruction doesn't start) before you're watching.
+    if not a.auto_start:
+        try:
+            input("[client] META sent. Start the server + open the viz URL it prints, "
+                  "then press ENTER here to begin streaming... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n[client] aborted before streaming.")
+            sender.send_stop(); cap.stop(); return
 
     running = {"go": True}
     signal.signal(signal.SIGINT, lambda *_: running.__setitem__("go", False))
 
     sent = 0
-    print(f"[client] capturing (k={a.k}, keyframe_disparity={a.keyframe_disparity}, "
-          f"ir={a.enable_ir}); Ctrl+C to stop")
+    print(f"[client] streaming (k={a.k}, ir={a.enable_ir}); Ctrl+C to stop")
     try:
-        for f in select_stream(cap, a.k, a.keyframe_disparity):
+        for f in blur_select(cap.frames(), a.k):
             if not running["go"]:
                 break
             ok, rgb_buf = cv2.imencode(".jpg", f["bgr"], [cv2.IMWRITE_JPEG_QUALITY, a.jpeg_quality])

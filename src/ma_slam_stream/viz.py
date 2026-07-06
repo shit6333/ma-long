@@ -38,9 +38,17 @@ class RerunViz:
         if mode == "spawn":
             rr.spawn()
         elif mode == "web":
-            rr.serve_web(open_browser=False)
-            print("[viz] rerun web viewer served — open the URL above (or http://<server>:9090) "
-                  "in a browser")
+            import urllib.parse
+            web_port, grpc_port = 9090, 9876
+            rr.serve_web(open_browser=False, web_port=web_port, grpc_port=grpc_port)
+            ip = _primary_ip()
+            grpc = f"rerun+http://{ip}:{grpc_port}/proxy"
+            self.web_url = f"http://{ip}:{web_port}/?url=" + urllib.parse.quote(grpc, safe="")
+            # The bare http://host:9090 only shows rerun's welcome screen — the viewer needs the
+            # ?url=... that points back at THIS server's data stream, so print the full URL.
+            print("\n[viz] ============ OPEN THIS URL IN A BROWSER ============")
+            print(f"[viz]   {self.web_url}")
+            print("[viz] ===================================================\n")
         elif mode == "connect":
             url = addr or "rr+http://127.0.0.1:9876"
             rr.connect_grpc(url)
@@ -84,6 +92,19 @@ class RerunViz:
             self._log_submap_points(sm, slam.graph, budget)
             self._logged.add(sm.base_id)
         self._log_trajectory(slam)
+
+
+def _primary_ip() -> str:
+    """Best-effort primary outbound IPv4 (so the browser can reach this server's data stream)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def graph_center(graph, key) -> np.ndarray:
