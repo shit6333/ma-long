@@ -36,23 +36,24 @@ import time
 # make the src/ sibling packages (model, ma_slam, align, ...) importable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import cv2
 import numpy as np
 import torch
 
 from model.inputs import MODES, load_intrinsics
 from ma_slam.solver import MaSlam, DEFAULT_CONFIG
-from ma_slam.keyframe_flow import DisparityKeyframer
 from ma_slam_stream.sources import make_source
 from ma_slam_stream.realsense import add_capture_args, capture_from_args
 from ma_slam_stream.viz import make_viz
 
 
-def _finalize(slam, out, n, elapsed, fps, vram, mode):
+def _finalize(slam, out, n, elapsed, fps, vram, mode, compute_fps=None, compute_s=None):
     """Write poses / merged PLY / stats / loops — mirrors MaSlam.run's tail, externally."""
-    print(f"[ma_slam] timing: {elapsed:.1f}s for {n} frames = {fps:.2f} fps "
-          f"(streaming, model-load excluded) | peak VRAM {vram:.1f} GB | "
-          f"submap_size={slam.cfg['submap_size']}")
+    extra = ""
+    if compute_fps:
+        extra = (f" | reconstruction {compute_fps:.2f} fps (GPU only, {compute_s:.1f}s) "
+                 f"— end-to-end is bounded by frame arrival, not the model")
+    print(f"[ma_slam] {n} keyframes in {elapsed:.1f}s = {fps:.2f} fps end-to-end"
+          f"{extra} | peak VRAM {vram:.1f} GB | submap_size={slam.cfg['submap_size']}")
     poses_txt = os.path.join(out, "camera_poses.txt")
     slam.map.write_poses(slam.graph, poses_txt)
     combined_ply = os.path.join(out, "combined_pcd.ply")
@@ -68,7 +69,10 @@ def _finalize(slam, out, n, elapsed, fps, vram, mode):
         "submap_size": slam.cfg["submap_size"], "overlap": slam.cfg["overlap"],
         "n_frames": n, "n_submaps": slam.map.num_submaps(),
         "loops_accepted": n_accept, "loops_candidates": len(slam.loop_log),
-        "fps": round(fps, 2), "seconds": round(elapsed, 1), "peak_vram_gb": round(vram, 2),
+        "fps_end_to_end": round(fps, 2),
+        "fps_reconstruction": (round(compute_fps, 2) if compute_fps else None),
+        "seconds": round(elapsed, 1), "compute_seconds": (round(compute_s, 1) if compute_s else None),
+        "peak_vram_gb": round(vram, 2),
         "coloc_ratio": slam.cfg["Loop"]["coloc_ratio"], "loop_enabled": slam.cfg["Loop"]["enable"],
         "depth_max": slam._depth_max, "streaming": True,
     }
@@ -85,23 +89,23 @@ def _finalize(slam, out, n, elapsed, fps, vram, mode):
 
 
 def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, dump_every,
-                viz=None, keyframe_disparity=0.0):
-    """Accumulate live frames into submaps and feed them to slam.process_submap.
+                viz=None):
+    """Accumulate live keyframes into submaps and feed them to slam.process_submap.
 
-    With ``keyframe_disparity > 0`` a causal LK optical-flow gate runs per arriving frame
-    (same ``DisparityKeyframer`` as the offline path): low-parallax frames are dropped before
-    accumulation, so ``submap_size`` counts keyframes. Non-keyframes are still fed to the gate
-    (to track displacement) but never enter a submap."""
+    The producer (client / local source) already blur-selects AND runs the LK keyframe gate, so
+    frames arriving here are keyframes; we just window them (``submap_size`` counts keyframes).
+
+    Timing reports TWO numbers so a slow live feed doesn't look like a slow model:
+      * end-to-end fps  = keyframes / wall-clock from the FIRST frame to the last — bounded by how
+        fast keyframes arrive (camera motion, k, gate, network), NOT by the model.
+      * reconstruction fps = keyframes / time actually spent inside process_submap (GPU only).
+    """
     # the solver caches these on the instance (offline run() sets them the same way).
     slam._mode, slam._input_K, slam._depth_scale, slam._depth_max = (
         mode, intrinsics, depth_scale, depth_max)
     want_depth = "depth" in mode
     size = slam.cfg["submap_size"]
     overlap = slam.cfg["overlap"]
-    keyframer = DisparityKeyframer(keyframe_disparity) if keyframe_disparity > 0 else None
-    if keyframer is not None:
-        print(f"[ma_slam] keyframe gate ON: disparity > {keyframe_disparity:g}px "
-              f"(submap_size counts keyframes)")
 
     print("[ma_slam] loading model...")
     _ = slam.model                                # force model load before timing
@@ -110,19 +114,21 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
     cuda = torch.cuda.is_available()
     if cuda:
         torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
     n_frames = 0
     carry: list = []                              # overlap frame(s) from the previous submap
     buf: list = []                                # frames accumulating toward the next submap
-
     loops_seen = [0]
+    t_first = [None]                              # wall time of the 1st frame (excludes startup idle)
+    compute_s = [0.0]                             # cumulative process_submap time (reconstruction only)
 
     def _process(window):
         rgb = [f[0] for f in window]
         dep = [f[1] for f in window] if want_depth else None
         if want_depth and any(d is None for d in dep):
             raise ValueError("depth mode but a frame arrived without a depth path")
+        tc = time.time()
         slam.process_submap(rgb, dep)
+        compute_s[0] += time.time() - tc          # count only the GPU/reconstruction work
         print(f"[ma_slam] submap {slam.stats['n_submaps']} (+{len(window)} frames, "
               f"{n_frames} total) | nodes={len(slam.graph.initialized)} "
               f"loops={slam.stats['n_loops']}")
@@ -135,10 +141,8 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
         for frame in source:                      # blocks until next frame / stop sentinel
             if frame is None:
                 break
-            if keyframer is not None:              # causal LK gate: drop low-parallax frames
-                img = cv2.imread(frame[0], cv2.IMREAD_COLOR)
-                if img is None or not keyframer.step(img):
-                    continue
+            if t_first[0] is None:
+                t_first[0] = time.time()          # start the clock at the FIRST real frame
             buf.append(frame)
             n_frames += 1
             if len(buf) >= size:
@@ -158,10 +162,12 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
         if len(window) >= 2:
             _process(window)
 
-    elapsed = time.time() - t0
-    fps = n_frames / elapsed if elapsed > 0 else 0.0
+    wall = (time.time() - t_first[0]) if t_first[0] else 0.0
+    wall_fps = n_frames / wall if wall > 0 else 0.0
+    compute_fps = n_frames / compute_s[0] if compute_s[0] > 0 else 0.0
     vram = torch.cuda.max_memory_allocated() / 1e9 if cuda else 0.0
-    return _finalize(slam, out, n_frames, elapsed, fps, vram, mode)
+    return _finalize(slam, out, n_frames, wall, wall_fps, vram, mode,
+                     compute_fps=compute_fps, compute_s=compute_s[0])
 
 
 def main():
@@ -180,9 +186,7 @@ def main():
                     help="K file; omit for 'local' (taken from the camera) or 'zmq' (META)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--submap_size", type=int, default=20)
-    ap.add_argument("--keyframe_disparity", type=float, default=25.0,
-                    help="LK optical-flow keyframe gate (px): drop low-parallax frames before "
-                         "accumulation; submap_size then counts keyframes. Default 25; 0 = off (every frame)")
+    # --keyframe_disparity is a producer-side selection flag (with --k), defined in add_capture_args.
     ap.add_argument("--no_loop", action="store_true")
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
@@ -228,7 +232,8 @@ def main():
     live_dir = os.path.join(a.out, "live")
     capture = capture_from_args(a, need_depth) if a.source == "local" else None
     source = make_source(a.source, live_dir=live_dir, want_depth=need_depth, bind=a.bind,
-                         watch_dir=a.watch_dir, poll=a.poll, capture=capture, k=a.k)
+                         watch_dir=a.watch_dir, poll=a.poll, capture=capture, k=a.k,
+                         keyframe_disparity=a.keyframe_disparity)
 
     # intrinsics: CLI file wins; otherwise (intr mode) take from the source (local camera / zmq META).
     intrinsics = load_intrinsics(a.intrinsic) if a.intrinsic else None
@@ -253,7 +258,7 @@ def main():
     res = stream_loop(slam, source, a.out, mode=a.mode, intrinsics=intrinsics,
                       depth_scale=depth_scale,
                       depth_max=(a.depth_max if a.depth_max > 0 else None),
-                      dump_every=a.dump_every, viz=viz, keyframe_disparity=a.keyframe_disparity)
+                      dump_every=a.dump_every, viz=viz)
     print(f"[ma_slam] stream done: submaps={res['n_submaps']} loops={res['n_loops']} "
           f"fps={res['fps']:.2f} -> {res['poses_txt']}")
 

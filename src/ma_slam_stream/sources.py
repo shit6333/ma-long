@@ -70,10 +70,12 @@ class _QueueSource:
 class LocalRealSenseSource(_QueueSource):
     """Capture from a RealSense attached to this machine; blur-select; write frames to disk."""
 
-    def __init__(self, live_dir: str, want_depth: bool, capture, k: int, maxsize: int = 64):
+    def __init__(self, live_dir: str, want_depth: bool, capture, k: int,
+                 keyframe_disparity: float = 25.0, maxsize: int = 64):
         super().__init__(maxsize=maxsize)
         self.capture = capture
         self.k = k
+        self.keyframe_disparity = keyframe_disparity
         self.want_depth = want_depth
         self.rgb_dir = os.path.join(live_dir, "rgb")
         self.depth_dir = os.path.join(live_dir, "depth")
@@ -89,10 +91,10 @@ class LocalRealSenseSource(_QueueSource):
         return super().start()
 
     def _run(self):
-        from ma_slam_stream.realsense import blur_select
+        from ma_slam_stream.realsense import select_stream
         try:
             idx = 0
-            for f in blur_select(self.capture.frames(), self.k):
+            for f in select_stream(self.capture, self.k, self.keyframe_disparity):
                 if self._stop.is_set():
                     break
                 rgb_path = os.path.join(self.rgb_dir, f"frame_{idx:06d}.jpg")
@@ -229,11 +231,11 @@ class FolderFrameSource(_QueueSource):
 
 def make_source(kind: str, *, live_dir: str, want_depth: bool, bind: str = "tcp://*:5599",
                 watch_dir: Optional[str] = None, poll: float = 0.05,
-                capture=None, k: int = 1) -> _QueueSource:
+                capture=None, k: int = 1, keyframe_disparity: float = 25.0) -> _QueueSource:
     if kind == "local":
         if capture is None:
             raise ValueError("source 'local' needs a RealSenseCapture (capture=...)")
-        return LocalRealSenseSource(live_dir, want_depth, capture, k).start()
+        return LocalRealSenseSource(live_dir, want_depth, capture, k, keyframe_disparity).start()
     if kind == "zmq":
         return ZmqFrameSource(bind=bind, live_dir=live_dir, want_depth=want_depth).start()
     if kind == "folder":

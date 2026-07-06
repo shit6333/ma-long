@@ -85,7 +85,7 @@ no client). `--viz spawn` opens a native window; use `--viz web` + the printed U
 | `--bind` | `[zmq]` server PULL address (default `tcp://*:5599`). |
 | `--watch_dir` | `[folder]` dir to watch (default `<out>/live/incoming`). |
 | `--k` | blur window (producer) — keep the sharpest of every `k` frames (`1` = every frame). Start at 2–4. |
-| `--keyframe_disparity` | LK keyframe gate (server) — see §3; default 25 px on, `0` = every frame. |
+| `--keyframe_disparity` | LK keyframe gate (producer) — see §3; default 25 px on, `0` = every frame. |
 | `--viz {none, spawn, web, connect}` | real-time rerun viewer: `spawn` native window here · `web` browser · `connect` a remote viewer. |
 | `--viz_addr` | `[viz connect]` running viewer url, e.g. `rr+http://LAPTOP_IP:9876`. |
 | `--dump_every N` | write intermediate poses every N submaps (live preview file). |
@@ -108,21 +108,26 @@ server); `--viz web` needs only a browser.
 ## 5. Streaming pipeline
 
 ```
-producer: RealSense ─► blur-select (sharpest of k) ─► transport (zmq / folder / in-process)
-server:   LK keyframe gate (disparity) ─► accumulate submap_size keyframes ─► ma_slam.process_submap
+producer: RealSense ─► blur-select (sharpest of k) ─► LK keyframe gate (disparity) ─► transport
+server:   accumulate submap_size keyframes ─► ma_slam.process_submap
           (reconstruct chunk → place via shared overlap frame → global PGO → loop closure)
           ─► [--viz] log new points + trajectory to rerun
 ```
 
-- **Frame selection is two stages, in two places.** **(1) Blur-select** (`--k`) runs on the
-  *producer* (laptop for `zmq`/`folder`, in-process for `local`): Laplacian-variance sharpest of
-  every `k`, sent as JPEG (rgb) + 16-bit PNG (depth in mm → server `depth_scale=1000`).
-  **(2) LK keyframe gate** (`--keyframe_disparity`, default 25 px, on — same
-  `DisparityKeyframer` as offline `ma_slam`) runs on the *server*, dropping low-parallax frames
-  before accumulation so `submap_size` counts genuine keyframes. Set `--keyframe_disparity 0` for
-  every-frame behaviour. (Gating server-side keeps it uniform across transports; the cost is that
-  `zmq`/`folder` still transmit every blur-selected frame — move the gate to the client if
-  bandwidth matters.) Larger `k` removes blur but widens the baseline — keep it small.
+- **Frame selection runs on the producer** (laptop for `zmq`/`folder`, in-process for `local`),
+  in two stages: **(1) blur-select** (`--k`) — Laplacian-variance sharpest of every `k`; then
+  **(2) LK keyframe gate** (`--keyframe_disparity`, default 25 px, on — mirrors offline
+  `ma_slam`) drops low-parallax frames so `submap_size` counts genuine keyframes. Gating on the
+  producer means a near-static camera sends almost nothing → less bandwidth, and the server skips
+  disk-writing / LK on dropped frames (the LK runs on the idle laptop CPU, no extra packages).
+  Only keyframes go on the wire, as JPEG (rgb) + 16-bit PNG (depth in mm → server
+  `depth_scale=1000`). `--keyframe_disparity 0` = every frame. Larger `k` removes blur but widens
+  the baseline — keep it small.
+- **Two FPS numbers** are reported at stop (and in `run_stats`). *End-to-end fps* = keyframes /
+  wall-clock from the first frame — bounded by how fast keyframes arrive (camera motion, `k`,
+  gate, network), so it's low by design and is **not** the model speed. *Reconstruction fps* =
+  keyframes / time actually inside `process_submap` (GPU only) — the real backbone throughput;
+  the GPU mostly idles waiting for live input.
 - **Submap accumulation** carries each submap's last frame as the next submap's first (shared
   overlap), exactly like the offline windowing; this anchors each new submap to the global map.
 - **Reconstruction / loop closure** is unchanged `ma_slam` — global pose-graph re-optimized after
