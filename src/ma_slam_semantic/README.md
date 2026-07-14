@@ -106,19 +106,25 @@ strict=False 載入——**`FROZEN_MODEL_ARGS` 的架構參數與 ckpt 綁定，
 - **s0011 e2e**：SLAM ATE 與無 hooks 基準逐字一致（0.0589）；輸出 71 instances。
 - **s0231 LC**：見上。KV reset 閥門（`kv_reset`，預設 off）全程未觸發（pose delta < 0.5m）。
 
-## 效能（profile_sem 實測，GT 模式、chunk 8）
+## 效能（profile_sem 實測）
 
 - Forward 僅 **66 ms/frame**（causal 12.4 / FastSAM 11.7 / TIPS 10.9 / M2F 9.6 /
   DPT 5.7 / DINO 4.6）——**FastSAM 不是瓶頸**。
-- 瓶頸是 CPU 後處理 **426 ms/frame**：`lift_proposal_to_3d` 191（Python tuple-set
-  voxel 化 + CPU IQR）+ dense sem_feat GPU→CPU 搬運 165（712MB/frame，只為了 pool
-  mask-mean —— GPU pooling 可整段消掉）。此成本 OpenSe3r 原版同樣存在
-  （`update_instances` 寫死 `device='cpu'`）。GPU 化後語意端估 1.96 → ~9 fps。
-- VRAM：權重 3.75GB、activation 峰值 ~26GB（bf16、8 幀）、**KV cache 線性成長
-  62.4MB/frame**（1000 幀 = 61GB ⇒ 長序列需 window/H2O policy）；ma 模式
-  （+MapAnything 同卡）總峰值 49.4GB。
+- 原瓶頸是 CPU 後處理 426 ms/frame（`lift_proposal_to_3d` 191：Python tuple-set
+  voxel 化 + CPU IQR；dense sem_feat GPU→CPU 搬運 165：712MB/frame。OpenSe3r 原版
+  同樣存在——`update_instances` 寫死 `device='cpu'`）。
+- **`proposals.py` 已 GPU 化**（NMS/resolve 餵 GPU 張量、sem_query 用 `index_add_`
+  批次 pool、lift 用 GPU quantile/median/`torch.unique` 後才落地建 set）：
+  A/B 驗證與 CPU 參考路徑**位元級一致**（center/bbox err=0、voxel Jaccard=1、
+  sem_query cos=1；`make_proposals_cpu` 保留供回歸），**441 → 18 ms/frame（24×）**。
+  Golden 端到端 **1.96 → 10.0 fps**，AP 25.61/40.62/54.70（雜訊範圍內）。
+- VRAM：權重 3.75GB；**activation 隨 chunk T 線性 ~2.3GB/frame**（chunk 8 峰值
+  ~26GB → chunk 4 ~15GB，M2F dAlloc 精準減半），故 `chunk_size` 預設 4；
+  **KV cache 線性成長 62.4MB/frame**（1000 幀 = 61GB ⇒ 長序列需 window/H2O
+  policy），與 chunk size 無關。ma 模式（+MapAnything 同卡）chunk 8 時總峰值 49.4GB。
 
 ## 待辦（S5）
 
-GPU 化 proposals（最大效益）、H2O KV policy（`kv_policies.py` seam 已留）、KV-reset
-閥門的實測決策（需更大 drift 的場景）、labeled `combined_pcd` 匯出、更多資料集。
+H2O KV policy（`kv_policies.py` seam 已留；KV 成長是長序列的 VRAM 大頭）、KV-reset
+閥門的實測決策（需更大 drift 的場景）、labeled `combined_pcd` 匯出、更多資料集、
+下一個效能目標：forward 66ms 與 match_chunk 的 O(P·C) 配分。

@@ -131,7 +131,9 @@ class SemConfig:
     device: str = "cuda"
     resolution: Tuple[int, int] = (518, 336)      # (W, H) — must match training
     attn_mode: str = "causal"
-    chunk_size: int = 8                           # frames per causal batch (gt mode)
+    # frames per causal batch. KV-causal => results are batching-invariant; this is
+    # purely a VRAM knob (activations ~2.3 GB/frame: 8 -> ~19 GB peak, 4 -> ~10 GB).
+    chunk_size: int = 4
 
     # geometry conditioning scale: 'gt_seq_median' (golden gt mode, computed upfront)
     # or 'first_chunk' (online: capture from the first chunk's output, then freeze —
