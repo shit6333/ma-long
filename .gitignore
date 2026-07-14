@@ -12,7 +12,7 @@ src/weights/hf_cache/
 *.pth
 
 # Third-party repos (clone separately — see INSTALL.md; not redistributed here)
-thirdparty/
+/thirdparty/
 
 # Local datasets (ship a minimal scene in example_data/ instead)
 data/
@@ -33,3 +33,6 @@ CLAUDE.local.md
 # OS / editor
 .DS_Store
 *.swp
+
+# vendored OpenSe3r weights (14 GB; code is committed, weights are not)
+vendor/weights/

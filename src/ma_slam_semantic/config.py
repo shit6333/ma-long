@@ -18,13 +18,45 @@ from argparse import Namespace
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-OPENSE3R_ROOT = "/mnt/HDD4/ricky/OpenSe3r"
+# OpenSe3r code root resolution, in priority order:
+#   1. $OPENSE3R_ROOT env var (e.g. point at the live repo to compare against it)
+#   2. the self-contained vendored copy at <ma_long>/vendor (default — 帶著走)
+# vendor/ mirrors the OpenSe3r root layout, so slam_opense3r/run.py's own
+# file-relative sys.path appends (thirdparty/, STream3R/) keep working verbatim.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+VENDOR_ROOT = os.path.join(_REPO_ROOT, "vendor")
+OPENSE3R_ROOT = os.environ.get("OPENSE3R_ROOT", VENDOR_ROOT)
+
+# weight files per root: the vendored copies are renamed under vendor/weights/
+# (gitignored); the live repo keeps its original scattered locations.
+_WEIGHTS = {
+    "vendor": dict(
+        ckpt_path=os.path.join(VENDOR_ROOT, "weights/opense3r_fastsam_query_semconf.pth"),
+        vggt_ckpt=os.path.join(VENDOR_ROOT, "weights/vggt_1b.pt"),
+        fastsam_ckpt=os.path.join(VENDOR_ROOT, "weights/fastsam_x.pt"),
+        # TIPS npz is found module-relatively (tips/pytorch/checkpoints/ holds
+        # relative symlinks into vendor/weights/) — no path arg needed.
+    ),
+    "live": dict(
+        ckpt_path="{root}/outputs/opense3r_fastsam_query_semconf/checkpoint-last.pth",
+        vggt_ckpt="{root}/checkpoints/VGGT.pt",
+        fastsam_ckpt="/mnt/HDD4/ricky/sam_test/FastSAM-x.pt",
+    ),
+}
 
 
-def ensure_opense3r(root: str = OPENSE3R_ROOT) -> None:
+def _weight_paths(root: str) -> dict:
+    if os.path.abspath(root) == os.path.abspath(VENDOR_ROOT):
+        return dict(_WEIGHTS["vendor"])
+    return {k: v.format(root=root) for k, v in _WEIGHTS["live"].items()}
+
+
+def ensure_opense3r(root: str = None) -> str:
     """Make OpenSe3r importable (it appends its own thirdparty paths on import)."""
+    root = root or OPENSE3R_ROOT
     if root not in sys.path:
         sys.path.append(root)
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -36,11 +68,11 @@ def ensure_opense3r(root: str = OPENSE3R_ROOT) -> None:
 FROZEN_MODEL_ARGS = dict(
     backend="da3",
     gt_geo_input=True,           # skip DA3 geometry backbone (external geometry)
-    ckpt_path=os.path.join(OPENSE3R_ROOT, "outputs/opense3r_fastsam_query_semconf/checkpoint-last.pth"),
-    vggt_ckpt=os.path.join(OPENSE3R_ROOT, "checkpoints/VGGT.pt"),
-    da3_ckpt=os.path.join(OPENSE3R_ROOT, "checkpoints/da3_large"),          # unused (skipped)
-    lbotv_ckpt=os.path.join(OPENSE3R_ROOT, "checkpoints/lingbot_vision_vitl"),  # unused (dino=vggt)
-    lseg_ckpt=os.path.join(OPENSE3R_ROOT, "checkpoints/demo_e200.ckpt"),    # unused (tips backbone)
+    # ckpt_path / vggt_ckpt / fastsam_ckpt are filled per-root by model_args()
+    # (vendor/weights/* renamed copies, or the live repo's original locations).
+    da3_ckpt="checkpoints/da3_large",             # unused (geometry backbone skipped)
+    lbotv_ckpt="checkpoints/lingbot_vision_vitl",  # unused (dino_backbone=vggt)
+    lseg_ckpt="checkpoints/demo_e200.ckpt",       # unused (tips semantic backbone)
     # encoders / causal branch
     dino_backbone="vggt",
     semantic_backbone="tips-v2-l14",
@@ -85,7 +117,6 @@ FROZEN_MODEL_ARGS = dict(
     query_box_size_extent_aware=False,
     use_merge_head=False,
     fastsam_query=True,
-    fastsam_ckpt="/mnt/HDD4/ricky/sam_test/FastSAM-x.pt",
     fastsam_conf=0.2,
     fastsam_iou=0.9,
     fastsam_max_regions=100,
@@ -161,8 +192,14 @@ class SemConfig:
     mask_2d_top_k: int = 15
 
     def model_args(self) -> Namespace:
-        """The frozen args as the Namespace ``slam_opense3r.run.load_model`` expects."""
-        return Namespace(**FROZEN_MODEL_ARGS)
+        """The frozen args as the Namespace ``slam_opense3r.run.load_model`` expects,
+        with weight paths resolved for the active OpenSe3r root."""
+        args = dict(FROZEN_MODEL_ARGS)
+        args["da3_ckpt"] = os.path.join(self.opense3r_root, args["da3_ckpt"])
+        args["lbotv_ckpt"] = os.path.join(self.opense3r_root, args["lbotv_ckpt"])
+        args["lseg_ckpt"] = os.path.join(self.opense3r_root, args["lseg_ckpt"])
+        args.update(_weight_paths(self.opense3r_root))
+        return Namespace(**args)
 
     @property
     def patch_size(self) -> int:

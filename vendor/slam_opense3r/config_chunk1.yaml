@@ -1,0 +1,33 @@
+device: 'cuda:0'
+
+# ── Mapping schedule ──────────────────────────────────────────────────────────
+# Number of frames to collect before the first geometry initialization.
+map_init_window: 8
+
+# Process a new geometry step every map_every new frames.
+map_every: 4
+
+# ── Keyframe management ───────────────────────────────────────────────────────
+max_keyframes: 10
+min_keyframes: 7
+top_k_keyframes: 4
+bridge_keyframes: 1
+
+# Minimum pose distance to qualify as a new keyframe.
+keyframe_threshold: 0.15
+
+# Keyframe resampling thresholds (for loop closure and diversity).
+keyframe_resample_threshold: 0.4
+keyframe_resample_threshold_max_f: 1.2
+keyframe_resample_threshold_max_b: 1.2
+keyframe_resample_threshold_min: 0.1
+
+# ── Feature storage ───────────────────────────────────────────────────────────
+# Voxel size in metres (only used when feat_storage='voxel').
+# semantic_voxel_size: 0.03
+semantic_voxel_size: 0.05
+
+# Confidence threshold for masking low-quality geometry points at export.
+conf_threshold: 0.0
+
+chunk_size: 1
