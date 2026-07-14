@@ -23,14 +23,15 @@ from ma_slam_semantic.instance_map import InstanceTable, SlamGeoResolver
 
 class SemanticHooks:
     def __init__(self, cfg: SemConfig, out_dir: str, name: str = "scene",
-                 device: Optional[str] = None, gt_anchor=None):
+                 device: Optional[str] = None, gt_positions=None):
         self.cfg = cfg
         self.out_dir = out_dir
         self.name = name
-        # GT first-frame cam->world (4x4). When set, exports are rigidly mapped into
-        # the GT-mesh frame via T_align = gt_anchor @ inv(G_first) (the OpenSe3r
-        # align_to_gt_first_frame convention) so GT-mesh evals line up.
-        self.gt_anchor = gt_anchor
+        # GT camera positions [N,3] (row i = frame i). When set, exports are rigidly
+        # mapped into the GT-mesh frame via SE3 Umeyama over the WHOLE trajectory —
+        # more robust than first-frame anchoring, whose frame-0 estimation error
+        # would shift the entire map (visible as depressed AP on drifty scenes).
+        self.gt_positions = gt_positions
         self.model = SemanticModel(cfg, device=device)
         self.bridge = SubmapBridge(cfg.resolution)
         self.tracker = PoseTracker()
@@ -73,11 +74,25 @@ class SemanticHooks:
             return
         import numpy as np
         T_align = None
-        if self.gt_anchor is not None:
-            first_key = min(sm.base_id for sm in gmap.ordered() if not sm.is_lc)
-            T_align = np.asarray(self.gt_anchor) @ np.linalg.inv(graph.get_pose(first_key))
-            print(f"[sem_hooks] align-to-GT-first-frame: |t|="
-                  f"{np.linalg.norm(T_align[:3, 3]):.3f} m")
+        if self.gt_positions is not None:
+            from eval import umeyama_sim3
+            # per-frame optimized camera centres, deduped by key (== frame ordinal)
+            centres = {}
+            for sm in gmap.ordered():
+                if sm.is_lc:
+                    continue
+                for i in range(sm.n):
+                    centres[sm.key(i)] = graph.get_pose(sm.key(i))[:3, 3]
+            keys = sorted(centres)
+            est = np.stack([centres[k] for k in keys])
+            gt = np.asarray(self.gt_positions)[keys]
+            _, R, _ = umeyama_sim3(est, gt)          # rigid: rotation + centroid shift
+            t = gt.mean(0) - R @ est.mean(0)
+            T_align = np.eye(4)
+            T_align[:3, :3], T_align[:3, 3] = R, t
+            rmse = float(np.sqrt(np.mean(np.sum(((est @ R.T + t) - gt) ** 2, axis=1))))
+            print(f"[sem_hooks] SE3-Umeyama align to GT ({len(keys)} frames): "
+                  f"residual RMSE {rmse:.3f} m")
         from ma_slam_semantic.export import export_all
         res = export_all(self.table, num_frames=self.n_frames,
                          out_dir=self.out_dir, name=self.name, cfg=self.cfg,

@@ -58,7 +58,7 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
 
     def _frames(d):
         fs = []
-        for ext in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.PNG"):
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.PNG", "*.tiff", "*.TIFF"):
             fs += glob.glob(os.path.join(d, ext))
         return sorted(fs)
 
@@ -69,10 +69,22 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     need_depth = "depth" in a.mode
     depth_paths = None
     intrinsics = None
+    depth_scale = 1000.0                     # uint16-mm convention (ScanNet PNG)
     if need_depth:
         depth_paths = _frames(os.path.join(a.data, "depth"))
+        if not depth_paths:
+            raise FileNotFoundError(f"no depth frames under {a.data}/depth")
         n = min(len(image_paths), len(depth_paths))
+        if len(image_paths) != len(depth_paths):
+            print(f"[ma_sem] color/depth count mismatch "
+                  f"({len(image_paths)}/{len(depth_paths)}); truncating to {n}")
         image_paths, depth_paths = image_paths[:n], depth_paths[:n]
+        # float depth files (e.g. .TIFF) are already metres -> scale 1.0
+        from PIL import Image
+        d0 = np.asarray(Image.open(depth_paths[0]))
+        if np.issubdtype(d0.dtype, np.floating):
+            depth_scale = 1.0
+            print("[ma_sem] float depth detected -> depth_scale=1.0 (metres)")
     if ("intr" in a.mode) or need_depth:
         intrinsics = load_intrinsics(os.path.join(a.data, "intrinsic.txt"))
 
@@ -80,20 +92,15 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     slam_cfg["submap_size"] = a.submap_size
     slam_cfg["Loop"]["enable"] = not a.no_loop
 
-    # GT first-frame anchor: map exports into the GT-mesh frame for mesh-based evals.
-    gt_anchor = None
+    # GT trajectory: exports get SE3-Umeyama-aligned into the GT-mesh frame.
+    gt_positions = None
     if a.gt:
-        rows = np.loadtxt(a.gt, comments="#").reshape(-1, 8)
-        tx, ty, tz, qx, qy, qz, qw = rows[0][1:]
-        from scipy.spatial.transform import Rotation
-        gt_anchor = np.eye(4)
-        gt_anchor[:3, :3] = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
-        gt_anchor[:3, 3] = (tx, ty, tz)
+        gt_positions = np.loadtxt(a.gt, comments="#").reshape(-1, 8)[:, 1:4]
 
-    hooks = SemanticHooks(cfg, a.out, name=name, gt_anchor=gt_anchor)
+    hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions)
     slam = MaSlam(config=slam_cfg, model=None, hooks=hooks)
     res = slam.run(image_paths, a.out, mode=a.mode, depth_paths=depth_paths,
-                   intrinsics=intrinsics,
+                   intrinsics=intrinsics, depth_scale=depth_scale,
                    depth_max=(a.depth_max if a.depth_max > 0 else None))
 
     if a.gt:
