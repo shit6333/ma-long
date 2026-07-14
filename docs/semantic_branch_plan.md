@@ -1,5 +1,26 @@
 # ma_slam Semantic Branch — Implementation Plan
 
+> **STATUS 2026-07-14 — S1-S4 done, all gates passed** (commits cbbe1d1/989c751/afe9615/f03cfd4):
+> - S1 regression: s0011 identical (0.0589); unchanged again with hooks attached.
+> - Golden gate (scenenn 005, GT geometry, same eval protocol benchmark_void+segment_snap):
+>   port AP 26.17/41.55/53.65 vs reference npz 25.12/42.35/52.97 — within noise
+>   (streaming count 132 == 132). NOTE: the old summary's "AP 14.71" is the
+>   pre-2026-07-12 strict-legacy protocol; don't compare against it.
+> - LC gate (s0231, 10 loops): Sim3-ATE 0.099 vs no-loop 0.212; instances 213 vs 240
+>   — healed geometry merges revisits instead of duplicating. Lazy M-signature
+>   re-key ran through 10 loop events without incident; max pose delta stayed
+>   < kv_reset_delta 0.5 m (no KV resets, valve stayed off).
+> - query_text works on exports (005: door/bookshelf/desk/chair... sensible).
+> - Perf: ~1.66 fps end-to-end (semantic side dominates; ma_slam alone 15.5),
+>   peak 49.4 GB (MapAnything + semantic co-resident). S5 items still open.
+> Implementation deltas vs the sketches below: FastSAM lives INSIDE the model
+> (fastsam_query=True builds/wires it; no external segmenter), model built via
+> slam_opense3r.run.load_model from FROZEN args (backend=da3+gt_geo_input skips
+> the DA3 geometry backbone), images are [-1,1] (not dinov2-normed at load),
+> Obs stores only key+slot+mask (per-obs local centroid/bbox derivable via
+> lift), submaps are forwarded as chunk_size=8 sub-batches (KV-causal makes
+> batching invariant; caps VRAM).
+
 Port OpenSe3r's query-instance semantic mapping (the `pipeline_query_gt.py` path) onto
 `ma_slam` as an independent package `src/ma_slam_semantic/`. ma_slam itself gets only
 3 hooks + 2 accessors (zero behavior change); everything else is new code.
