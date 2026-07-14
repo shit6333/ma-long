@@ -76,22 +76,25 @@ class SemanticHooks:
         T_align = None
         if self.gt_positions is not None:
             from eval import umeyama_sim3
-            # per-frame optimized camera centres, deduped by key (== frame ordinal)
+            # per-frame optimized camera centres, deduped by FRAME ID (filename
+            # ordinal, last-wins like map.write_poses) — graph keys are NOT frame
+            # ordinals: overlap frames own two nodes (base+i per submap).
             centres = {}
             for sm in gmap.ordered():
                 if sm.is_lc:
                     continue
                 for i in range(sm.n):
-                    centres[sm.key(i)] = graph.get_pose(sm.key(i))[:3, 3]
-            keys = sorted(centres)
-            est = np.stack([centres[k] for k in keys])
-            gt = np.asarray(self.gt_positions)[keys]
+                    centres[int(sm.frame_ids[i])] = graph.get_pose(sm.key(i))[:3, 3]
+            gt_all = np.asarray(self.gt_positions)
+            fids = sorted(f for f in centres if 0 <= f < len(gt_all))
+            est = np.stack([centres[f] for f in fids])
+            gt = gt_all[fids]
             _, R, _ = umeyama_sim3(est, gt)          # rigid: rotation + centroid shift
             t = gt.mean(0) - R @ est.mean(0)
             T_align = np.eye(4)
             T_align[:3, :3], T_align[:3, 3] = R, t
             rmse = float(np.sqrt(np.mean(np.sum(((est @ R.T + t) - gt) ** 2, axis=1))))
-            print(f"[sem_hooks] SE3-Umeyama align to GT ({len(keys)} frames): "
+            print(f"[sem_hooks] SE3-Umeyama align to GT ({len(fids)} frames): "
                   f"residual RMSE {rmse:.3f} m")
         from ma_slam_semantic.export import export_all
         res = export_all(self.table, num_frames=self.n_frames,
