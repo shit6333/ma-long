@@ -24,6 +24,8 @@ import torch
 from ma_slam_semantic.config import SemConfig, ensure_opense3r
 from ma_slam_semantic.bridge import gt_chunks, gt_seq_box_scale
 from ma_slam_semantic.sem_model import SemanticModel
+from ma_slam_semantic.proposals import make_proposals
+from ma_slam_semantic.instance_map import InstanceTable, StaticGeoResolver
 
 
 def _load_gt_batch(data_path: str, demo_type: str, res, max_frames: int = 0) -> dict:
@@ -43,11 +45,60 @@ def _load_gt_batch(data_path: str, demo_type: str, res, max_frames: int = 0) -> 
     return batch
 
 
+def run_ma_slam(a, cfg: SemConfig) -> None:
+    """ma_slam-geometry mode: full online SLAM + semantic hooks."""
+    import copy
+    import glob
+
+    import numpy as np
+
+    from model.inputs import load_intrinsics
+    from ma_slam.solver import MaSlam, DEFAULT_CONFIG
+    from ma_slam_semantic.hooks import SemanticHooks
+
+    def _frames(d):
+        fs = []
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.PNG"):
+            fs += glob.glob(os.path.join(d, ext))
+        return sorted(fs)
+
+    name = a.name or os.path.basename(os.path.normpath(a.data))
+    image_paths = _frames(os.path.join(a.data, "rgb"))
+    if a.max_frames:
+        image_paths = image_paths[: a.max_frames]
+    need_depth = "depth" in a.mode
+    depth_paths = None
+    intrinsics = None
+    if need_depth:
+        depth_paths = _frames(os.path.join(a.data, "depth"))
+        n = min(len(image_paths), len(depth_paths))
+        image_paths, depth_paths = image_paths[:n], depth_paths[:n]
+    if ("intr" in a.mode) or need_depth:
+        intrinsics = load_intrinsics(os.path.join(a.data, "intrinsic.txt"))
+
+    slam_cfg = copy.deepcopy(DEFAULT_CONFIG)
+    slam_cfg["submap_size"] = a.submap_size
+    slam_cfg["Loop"]["enable"] = not a.no_loop
+
+    hooks = SemanticHooks(cfg, a.out, name=name)
+    slam = MaSlam(config=slam_cfg, model=None, hooks=hooks)
+    res = slam.run(image_paths, a.out, mode=a.mode, depth_paths=depth_paths,
+                   intrinsics=intrinsics,
+                   depth_max=(a.depth_max if a.depth_max > 0 else None))
+
+    if a.gt:
+        from eval import ate_rmse
+        s = ate_rmse(res["poses_txt"], a.gt, "sim3")
+        se = ate_rmse(res["poses_txt"], a.gt, "se3")
+        print(f"[ma_sem] Sim3-ATE={s['ate_rmse']:.4f} | SE3-ATE={se['ate_rmse']:.4f} | "
+              f"loops={res['n_loops']}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="ma_slam_semantic runner")
-    ap.add_argument("--geometry", default="gt", choices=["gt"],
+    ap.add_argument("--geometry", default="gt", choices=["gt", "ma"],
                     help="'gt' = golden-test geometry (OpenSe3r GT dataset); "
-                         "ma_slam mode is wired through ma_slam.run hooks (S4)")
+                         "'ma' = full ma_slam online SLAM + semantic hooks")
     ap.add_argument("--data", required=True)
     ap.add_argument("--demo_type", default="scenenn_gt", choices=["scenenn_gt", "scannet_gt"])
     ap.add_argument("--out", required=True)
@@ -57,7 +108,19 @@ def main():
     ap.add_argument("--save_2d_masks", action="store_true",
                     help="dump per-frame top-K instance-mask grids (S2 eyeball gate)")
     ap.add_argument("--mask_top_k", type=int, default=15)
+    # ma_slam-geometry mode args
+    ap.add_argument("--mode", default="rgb+depth+intr",
+                    help="[ma] ma_slam input mode (rgb / rgb+intr / rgb+depth / rgb+depth+intr)")
+    ap.add_argument("--submap_size", type=int, default=20, help="[ma] frames per submap")
+    ap.add_argument("--no_loop", action="store_true", help="[ma] disable loop closure")
+    ap.add_argument("--depth_max", type=float, default=0.0, help="[ma] clamp far depth (m)")
+    ap.add_argument("--gt", default=None, help="[ma] GT trajectory for ATE report")
     a = ap.parse_args()
+
+    if a.geometry == "ma":
+        cfg = SemConfig(box_scale_mode="first_chunk")
+        run_ma_slam(a, cfg)
+        return
 
     cfg = SemConfig(chunk_size=a.chunk_size, box_scale_mode="gt_seq_median",
                     save_2d_masks=a.save_2d_masks, mask_2d_top_k=a.mask_top_k)
@@ -70,6 +133,8 @@ def main():
 
     model = SemanticModel(cfg)
     model.set_box_scale(gt_seq_box_scale(batch))
+    resolver = StaticGeoResolver()
+    table = InstanceTable(cfg, resolver)
 
     t0 = time.time()
     n_done = 0
@@ -83,14 +148,19 @@ def main():
                 frame_start=chunk["frame_indices"][0],
                 out_dir=os.path.join(a.out, "2d_inst_masks"),
                 demo_name=name, top_k=cfg.mask_2d_top_k)
+        props, pix_map, pts_hd = make_proposals(out, chunk, cfg)
+        for t, key in enumerate(chunk["frame_keys"]):
+            resolver.register(key, pts_hd[t])
+        table.match_chunk(props, chunk["frame_keys"], pix_map)
         n_done += n
-        obj = out["objectness"][0].float()
-        print(f"[ma_sem] frames {n_done:4d}/{T}  "
-              f"obj>0.5/frame={(obj.sigmoid() > 0.5).sum().item() / n:5.1f}  "
-              f"{n_done / (time.time() - t0):.1f} fps")
+        print(f"[ma_sem] frames {n_done:4d}/{T}  proposals={len(props):3d}  "
+              f"instances={len(table)}  {n_done / (time.time() - t0):.1f} fps")
 
-    print(f"[ma_sem] done ({time.time() - t0:.1f}s). S3 adds proposals+instance table; "
-          f"S4 adds export.")
+    print(f"[ma_sem] streaming done ({time.time() - t0:.1f}s): {len(table)} instances")
+    from ma_slam_semantic.export import export_all
+    res = export_all(table, num_frames=T, out_dir=a.out, name=name, cfg=cfg)
+    print(f"[ma_sem] exported {res['n_instances']} instances "
+          f"({res['n_dropped']} noise-filtered) -> {a.out}")
 
 
 if __name__ == "__main__":
