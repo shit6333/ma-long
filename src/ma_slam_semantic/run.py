@@ -80,7 +80,17 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     slam_cfg["submap_size"] = a.submap_size
     slam_cfg["Loop"]["enable"] = not a.no_loop
 
-    hooks = SemanticHooks(cfg, a.out, name=name)
+    # GT first-frame anchor: map exports into the GT-mesh frame for mesh-based evals.
+    gt_anchor = None
+    if a.gt:
+        rows = np.loadtxt(a.gt, comments="#").reshape(-1, 8)
+        tx, ty, tz, qx, qy, qz, qw = rows[0][1:]
+        from scipy.spatial.transform import Rotation
+        gt_anchor = np.eye(4)
+        gt_anchor[:3, :3] = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+        gt_anchor[:3, 3] = (tx, ty, tz)
+
+    hooks = SemanticHooks(cfg, a.out, name=name, gt_anchor=gt_anchor)
     slam = MaSlam(config=slam_cfg, model=None, hooks=hooks)
     res = slam.run(image_paths, a.out, mode=a.mode, depth_paths=depth_paths,
                    intrinsics=intrinsics,

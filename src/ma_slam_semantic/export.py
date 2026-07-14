@@ -30,7 +30,12 @@ class _MemShim:
 
 
 def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
-               cfg: SemConfig, do_final_merge: bool = True) -> Dict:
+               cfg: SemConfig, do_final_merge: bool = True,
+               transformation=None) -> Dict:
+    """``transformation`` (4x4, optional): world-frame shift applied by the writers
+    to every exported center/bbox/voxel — used by ma_slam-geometry runs to map the
+    SLAM world into the GT-mesh frame (align-to-GT-first-frame), so the eval
+    scripts' kNN projection onto GT vertices is meaningful."""
     from amb3r.vis_query_instance_slam import (
         export_query_instance_voxels_ply,
         export_query_instance_boxes_ply,
@@ -41,6 +46,9 @@ def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
         filter_noise_instances,
     )
     os.makedirs(out_dir, exist_ok=True)
+    if transformation is not None:
+        import torch
+        transformation = torch.as_tensor(transformation, dtype=torch.float32)
 
     n_relift = table.rekey_all(force=True)          # final heal through the final graph
     n_merged = table.final_merge() if do_final_merge else 0
@@ -65,18 +73,18 @@ def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
 
     paths = {}
     paths["voxels_ply"] = os.path.join(out_dir, f"{name}_query_instance_voxels.ply")
-    export_query_instance_voxels_ply(mem, paths["voxels_ply"], transformation=None,
+    export_query_instance_voxels_ply(mem, paths["voxels_ply"], transformation=transformation,
                                      color_map=color_map, color_mode="desc",
                                      dropped_ids=dropped, verbose=True)
     paths["boxes_ply"] = os.path.join(out_dir, f"{name}_query_instance_boxes.ply")
-    export_query_instance_boxes_ply(mem, paths["boxes_ply"], transformation=None,
+    export_query_instance_boxes_ply(mem, paths["boxes_ply"], transformation=transformation,
                                     color_map=color_map, color_mode="desc",
                                     dropped_ids=dropped, verbose=True)
     paths["table_json"] = os.path.join(out_dir, f"{name}_query_instance_table.json")
-    dump_instance_table_json(mem, paths["table_json"], transformation=None,
+    dump_instance_table_json(mem, paths["table_json"], transformation=transformation,
                              dropped_ids=dropped, verbose=True)
     paths["labels_npz"] = os.path.join(out_dir, f"{name}_instance_labels.npz")
-    dump_instance_labels_npz(mem, paths["labels_npz"], transformation=None,
+    dump_instance_labels_npz(mem, paths["labels_npz"], transformation=transformation,
                              dropped_ids=dropped, verbose=True, objectness_agg="mean")
     paths["sem_queries_npz"] = os.path.join(out_dir, f"{name}_instance_sem_queries.npz")
     dump_instance_sem_queries_npz(mem, paths["sem_queries_npz"],

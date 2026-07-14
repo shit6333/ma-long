@@ -23,10 +23,14 @@ from ma_slam_semantic.instance_map import InstanceTable, SlamGeoResolver
 
 class SemanticHooks:
     def __init__(self, cfg: SemConfig, out_dir: str, name: str = "scene",
-                 device: Optional[str] = None):
+                 device: Optional[str] = None, gt_anchor=None):
         self.cfg = cfg
         self.out_dir = out_dir
         self.name = name
+        # GT first-frame cam->world (4x4). When set, exports are rigidly mapped into
+        # the GT-mesh frame via T_align = gt_anchor @ inv(G_first) (the OpenSe3r
+        # align_to_gt_first_frame convention) so GT-mesh evals line up.
+        self.gt_anchor = gt_anchor
         self.model = SemanticModel(cfg, device=device)
         self.bridge = SubmapBridge(cfg.resolution)
         self.tracker = PoseTracker()
@@ -67,9 +71,17 @@ class SemanticHooks:
     def on_finish(self, gmap, graph) -> None:
         if self.table is None:
             return
+        import numpy as np
+        T_align = None
+        if self.gt_anchor is not None:
+            first_key = min(sm.base_id for sm in gmap.ordered() if not sm.is_lc)
+            T_align = np.asarray(self.gt_anchor) @ np.linalg.inv(graph.get_pose(first_key))
+            print(f"[sem_hooks] align-to-GT-first-frame: |t|="
+                  f"{np.linalg.norm(T_align[:3, 3]):.3f} m")
         from ma_slam_semantic.export import export_all
         res = export_all(self.table, num_frames=self.n_frames,
-                         out_dir=self.out_dir, name=self.name, cfg=self.cfg)
+                         out_dir=self.out_dir, name=self.name, cfg=self.cfg,
+                         transformation=T_align)
         print(f"[sem_hooks] exported {res['n_instances']} instances "
               f"({res['n_dropped']} noise-filtered, {res['n_merged']} final-merged, "
               f"{len(self.loop_events)} loop events) -> {self.out_dir}")
