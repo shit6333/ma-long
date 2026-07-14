@@ -392,6 +392,28 @@ class InstanceTable:
         return out
 
     # ---------------------------------------------------------------- export view
+    def to_metadata_list(self) -> List[Dict]:
+        """Lightweight per-instance metadata for the JSON dump (reference schema)."""
+        out = []
+        for inst_id in sorted(self.records.keys()):
+            r = self.records[inst_id]
+            out.append({
+                "inst_id": inst_id,
+                "center": r.center.tolist(),
+                "bbox_min": r.bbox_min.tolist(),
+                "bbox_max": r.bbox_max.tolist(),
+                "bbox_volume_m3": r.bbox_volume,
+                "count": r.count,
+                "first_seen": r.first_seen,
+                "last_seen": r.last_seen,
+                "num_voxels": r.num_voxels,
+                "mean_objectness": r.mean_objectness,
+                "member_frames": r.member_frames,
+                "member_slots": r.member_slots,
+                "member_objectness": r.member_objectness,
+            })
+        return out
+
     def voxel_to_inst_map(self) -> Dict[Tuple[int, int, int], int]:
         """Winner-take-all voxel -> inst_id (most votes; ties -> lower id).
         Verbatim port of the reference implementation."""

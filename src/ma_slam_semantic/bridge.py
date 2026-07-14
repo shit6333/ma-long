@@ -130,6 +130,26 @@ def gt_chunks(batch: dict, chunk_size: int,
         )
 
 
+def split_chunk(chunk: Dict, size: int) -> Iterator[Dict]:
+    """Split a chunk into <=size-frame sub-chunks (KV-causal => batching-invariant;
+    matches the reference run's chunk_size=8 batching and caps forward peak VRAM)."""
+    T = chunk["images"].shape[1]
+    if T <= size:
+        yield chunk
+        return
+    for s in range(0, T, size):
+        e = min(s + size, T)
+        sub = {}
+        for k, v in chunk.items():
+            if torch.is_tensor(v):
+                sub[k] = v[:, s:e] if v.shape[0] == 1 else v[s:e]
+            elif isinstance(v, list):
+                sub[k] = v[s:e]
+            else:
+                sub[k] = v
+        yield sub
+
+
 # --------------------------------------------------------------------------- ma_slam source
 class SubmapBridge:
     """ma_slam ``Submap`` (+ current graph) -> semantic chunk.

@@ -46,13 +46,17 @@ class SemanticHooks:
                   f" ({'KV reset' if self.cfg.kv_reset else 'logged; kv_reset off'})")
             if self.cfg.kv_reset:
                 self.model.reset_kv()
+        from ma_slam_semantic.bridge import split_chunk
         chunk = self.bridge.chunk(sm, graph)
-        out = self.model.forward_chunk(chunk)
-        props, pix_map, _ = make_proposals(out, chunk, self.cfg)
-        self.table.match_chunk(props, chunk["frame_keys"], pix_map)
+        n_props = 0
+        for sub in split_chunk(chunk, self.cfg.chunk_size):
+            out = self.model.forward_chunk(sub)
+            props, pix_map, _ = make_proposals(out, sub, self.cfg)
+            self.table.match_chunk(props, sub["frame_keys"], pix_map)
+            n_props += len(props)
         self.n_frames += len(chunk["frame_keys"])
         print(f"[sem_hooks] submap {sm.base_id}: +{len(chunk['frame_keys'])} frames, "
-              f"{len(props)} proposals -> {len(self.table)} instances")
+              f"{n_props} proposals -> {len(self.table)} instances")
 
     def on_loop(self, key_new: int, key_old: int) -> None:
         # Healing is handled by the M-signature mechanism (stale records re-lift
