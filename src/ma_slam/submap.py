@@ -120,6 +120,19 @@ class Submap:
             pts, cols = pts[idx], cols[idx]
         return pts, cols
 
+    def frame_pose_global(self, graph, i: int) -> np.ndarray:
+        """Optimized global cam->world of frame i (current graph state)."""
+        return graph.get_pose(self.key(i))
+
+    def frame_points_global(self, graph, i: int) -> np.ndarray:
+        """Unfiltered (H,W,3) point map of frame i in the CURRENT global frame.
+
+        points are submap-LOCAL -> must go through M_i = G_i @ inv(L_i) (same 'fog'
+        gotcha as world_points_and_colors above).
+        """
+        M = graph.get_pose(self.key(i)) @ np.linalg.inv(self.poses_local[i])
+        return self.points[i] @ M[:3, :3].T + M[:3, 3]
+
     def overlap_pointcloud(self, frame_index: int):
         """Local point map (H*W,3) of one frame, for pairwise scale estimation."""
         return self.points[frame_index].reshape(-1, 3)

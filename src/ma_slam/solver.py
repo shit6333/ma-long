@@ -60,10 +60,14 @@ DEFAULT_CONFIG: Dict = {
 
 
 class MaSlam:
-    def __init__(self, config: Optional[Dict] = None, model=None, device: str = "cuda"):
+    def __init__(self, config: Optional[Dict] = None, model=None, device: str = "cuda",
+                 hooks=None):
         self.cfg = config or DEFAULT_CONFIG
         self.device = device
         self._model = model
+        # Duck-typed observer (on_submap / on_loop / on_finish), e.g. ma_slam_semantic's
+        # SemanticHooks. Called with post-optimize state; must not mutate SLAM state.
+        self.hooks = hooks
         g = self.cfg["Graph"]
         if g["manifold"] == "sim3":
             self.graph = Sim3PoseGraph(self.cfg)        # pypose Sim3LoopOptimizer backend
@@ -270,6 +274,8 @@ class MaSlam:
         self.graph.add_between(sm.key(cand.query_frame), match_sm.key(cand.match_frame),
                                rel, kind="loop")
         self.stats["n_loops"] += 1
+        if self.hooks is not None:
+            self.hooks.on_loop(sm.key(cand.query_frame), match_sm.key(cand.match_frame))
         return True
 
     # ------------------------------------------------------------------ coloc debug
@@ -335,6 +341,9 @@ class MaSlam:
 
         self.graph.optimize()
 
+        if self.hooks is not None:
+            self.hooks.on_submap(sm, self.map, self.graph)   # post-optimize poses
+
     def run(self, image_paths: Sequence[str], output_dir: str, *, mode: str = "rgb",
             depth_paths: Optional[Sequence[str]] = None,
             intrinsics: Optional[np.ndarray] = None, depth_scale: float = 1000.0,
@@ -373,6 +382,9 @@ class MaSlam:
         print(f"[ma_slam] timing: {elapsed:.1f}s for {n} frames = {fps:.2f} fps "
               f"(streaming, model-load excluded) | peak VRAM {vram:.1f} GB | "
               f"submap_size={self.cfg['submap_size']}")
+
+        if self.hooks is not None:
+            self.hooks.on_finish(self.map, self.graph)       # final graph, pre-export
 
         poses_txt = os.path.join(output_dir, "camera_poses.txt")
         self.map.write_poses(self.graph, poses_txt)
