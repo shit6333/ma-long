@@ -1396,6 +1396,9 @@ class OpenSe3rDA3(nn.Module):
         }
 
     def init_kv_cache(self) -> List:
+        # A fresh cache list marks a new streaming sequence — also wipe the
+        # optional STAC/H2O temporal KV manager (no-op when not registered).
+        self.causal_branch.reset_kv_mgr()
         return self.causal_branch.init_kv_cache()
 
     @torch.no_grad()

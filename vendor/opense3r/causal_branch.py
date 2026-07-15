@@ -419,6 +419,14 @@ class CausalBranch(nn.Module):
             self.instance_query_block_indices = []
             self.instance_queries = None
 
+        # ── STAC-style temporal KV manager (H2O) — inference-only, optional ──
+        # Populated by `register_kv_mgr()`; the actual manager is built lazily
+        # on the first streaming forward (token_per_frame needs the patch grid).
+        self.kv_manager = None
+        self._kv_mgr_cls = None
+        self._kv_mgr_kwargs = None
+        self._kv_mgr_managed: List[int] = []
+
     # ------------------------------------------------------------------
     # Attention mask
     # ------------------------------------------------------------------
@@ -547,6 +555,106 @@ class CausalBranch(nn.Module):
         return cache
 
     # ------------------------------------------------------------------
+    # STAC-style temporal KV manager (H2O) — inference only
+    # ------------------------------------------------------------------
+    # Ported from thirdparty/STAC causalvggt/models/aggregator.py.  Manages
+    # the global-block streaming KV with pinned(frame-0) + recent-window +
+    # per-layer/per-head heavy-hitter tokens instead of unbounded torch.cat.
+    # Register-attention blocks (special-tokens-only cache) are NOT managed —
+    # they keep the original cat path via their untouched kv_cache_list slot.
+
+    def register_kv_mgr(self, kv_manager_cls, **kwargs):
+        """Arm the KV manager. Idempotent; actual build is lazy (see forward).
+
+        kwargs are forwarded to `kv_manager_cls` (HeavyHittersKV): chunk_size,
+        recent_size, hh_size, pinned_idx, temperature, subsample_ratio,
+        attn_backend, dtype, device, buffer_size (frames; auto if omitted)...
+        """
+        from .stac_kv.sparse_attention import convert_global_attn
+        managed = [i for i in range(self.n_blocks)
+                   if i not in self.register_block_indices]
+        convert_global_attn(self.global_blocks, managed)
+        self._kv_mgr_cls = kv_manager_cls
+        self._kv_mgr_kwargs = dict(kwargs)
+        self._kv_mgr_managed = managed
+
+    def _maybe_build_kv_mgr(self, token_per_frame: int, device, dtype):
+        """Lazy-build the manager on the first streaming forward."""
+        if self.kv_manager is not None or self._kv_mgr_cls is None:
+            return
+        kwargs = dict(self._kv_mgr_kwargs)
+        kwargs.setdefault('device', device)
+        kwargs.setdefault('dtype', dtype)
+        if 'buffer_size' not in kwargs:
+            # STAC sizing: one chunk of headroom on top of the hot budget.
+            kwargs['buffer_size'] = (
+                int(kwargs.get('chunk_size', 1))
+                + len(kwargs.get('pinned_idx', []) or [])
+                + int(kwargs.get('recent_size', 1))
+                + int(kwargs.get('hh_size', 0))
+            )
+        attn0 = self.global_blocks[self._kv_mgr_managed[0]].attn
+        mgr = self._kv_mgr_cls(
+            num_layers      = self.n_blocks,
+            num_heads       = attn0.num_heads,
+            head_dim        = attn0.head_dim,
+            token_per_frame = int(token_per_frame),
+            register_layers = self._kv_mgr_managed,
+            **kwargs,
+        )
+        mgr.reset()
+        self.kv_manager = mgr
+        for i in self._kv_mgr_managed:
+            self.global_blocks[i].attn.kv_manager = mgr
+
+    def reset_kv_mgr(self):
+        """Wipe cache + scores for a new sequence (keeps allocation)."""
+        if self.kv_manager is not None:
+            self.kv_manager.reset()
+
+    def clear_kv_mgr(self):
+        """Free the manager entirely (detaches it from the attention layers)."""
+        if self.kv_manager is not None:
+            for i in self._kv_mgr_managed:
+                attn = self.global_blocks[i].attn
+                if hasattr(attn, 'kv_manager'):
+                    attn.kv_manager = None
+            self.kv_manager.free()
+            self.kv_manager = None
+
+    def prune_kv_mgr(self, timing: bool = False):
+        """H2O prune (pinned ∪ recent ∪ per-head top-k). Call once per chunk.
+
+        Returns elapsed ms when timing=True (0.0 otherwise / when inactive).
+        """
+        if self.kv_manager is None:
+            return 0.0
+        if timing:
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+        self.kv_manager.prune_kv()
+        if timing:
+            t1.record()
+            torch.cuda.synchronize()
+            return t0.elapsed_time(t1)
+        return 0.0
+
+    def get_kv_mgr_info(self) -> Optional[dict]:
+        """Cache stats for logging (tokens / MB per layer, kept-token ids)."""
+        if self.kv_manager is None:
+            return None
+        mgr = self.kv_manager
+        info = {
+            'layer_indices': mgr.get_layers(),
+            'kvcache_size':  mgr.get_offset(),          # tokens per managed layer
+        }
+        used, alloc = mgr.get_memory_usage()
+        info['kvcache_used_mb'] = used
+        info['kvcache_alloc_mb'] = alloc
+        return info
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -645,6 +753,12 @@ class CausalBranch(nn.Module):
             else:
                 x = torch.cat([reg, x], dim=1)                                     # [B*T, R+N, dim]
         P = N_patch + self.patch_start_idx
+
+        # --- STAC temporal KV manager: lazy build on first streaming call ---
+        if kv_cache_list is not None and self._kv_mgr_cls is not None:
+            _kv_dt = x.dtype if x.dtype in (torch.float16, torch.bfloat16) \
+                else torch.bfloat16
+            self._maybe_build_kv_mgr(P, device=x.device, dtype=_kv_dt)
 
         # --- Position embeddings ---
         # When pose_cond=True, the pose token gets pos=(0,0); all patch positions
