@@ -62,6 +62,12 @@ class SemanticHooks:
         self.n_frames += len(chunk["frame_keys"])
         print(f"[sem_hooks] submap {sm.base_id}: +{len(chunk['frame_keys'])} frames, "
               f"{n_props} proposals -> {len(self.table)} instances")
+        if hasattr(self.model.policy, "stats"):
+            info = self.model.policy.stats()
+            if info is not None:
+                print(f"[sem_hooks]   h2o-kv: tokens/layer={info['kvcache_size'][0]}"
+                      f"  used={info['kvcache_used_mb']:.0f}MB"
+                      f"  prune={self.model.policy.prune_ms:.1f}ms")
 
     def on_loop(self, key_new: int, key_old: int) -> None:
         # Healing is handled by the M-signature mechanism (stale records re-lift

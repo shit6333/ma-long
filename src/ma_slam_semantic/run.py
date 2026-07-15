@@ -144,15 +144,39 @@ def main():
     ap.add_argument("--conf_gate_coef", type=float, default=1.0,
                     help="[ma] scale on the per-submap mean-conf validity gate "
                          "(<1 keeps more points -> more coverage, noisier voxels)")
+    ap.add_argument("--kv_policy", default="none", choices=["none", "window", "h2o"],
+                    help="CausalBranch KV retention: 'none' (flat, unbounded), "
+                         "'window' (flat trim), 'h2o' (STAC temporal compression: "
+                         "pinned frame-0 + recent window + heavy-hitter tokens)")
+    ap.add_argument("--kv_window_size", type=int, default=None,
+                    help="[window] sliding-window frames")
+    ap.add_argument("--kv_keyframe_stride", type=int, default=None,
+                    help="[window] keep every S-th past frame")
+    ap.add_argument("--h2o_recent", type=int, default=8,
+                    help="[h2o] recent-window budget (frames)")
+    ap.add_argument("--h2o_hh", type=int, default=8,
+                    help="[h2o] heavy-hitter budget (frame-equivalents)")
+    ap.add_argument("--h2o_decay", type=float, default=0.9,
+                    help="[h2o] attention-score decay γ")
+    ap.add_argument("--h2o_subsample", type=float, default=1.0,
+                    help="[h2o] query subsample ratio for colsum scores")
     a = ap.parse_args()
 
+    kv_kwargs = dict(kv_policy=a.kv_policy,
+                     kv_window_size=a.kv_window_size,
+                     kv_keyframe_stride=a.kv_keyframe_stride,
+                     h2o_recent_frames=a.h2o_recent, h2o_hh_frames=a.h2o_hh,
+                     h2o_decay=a.h2o_decay, h2o_subsample=a.h2o_subsample)
+
     if a.geometry == "ma":
-        cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef)
+        cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef,
+                        **kv_kwargs)
         run_ma_slam(a, cfg)
         return
 
     cfg = SemConfig(chunk_size=a.chunk_size, box_scale_mode="gt_seq_median",
-                    save_2d_masks=a.save_2d_masks, mask_2d_top_k=a.mask_top_k)
+                    save_2d_masks=a.save_2d_masks, mask_2d_top_k=a.mask_top_k,
+                    **kv_kwargs)
     name = a.name or os.path.basename(os.path.normpath(a.data))
     os.makedirs(a.out, exist_ok=True)
 
@@ -184,6 +208,12 @@ def main():
         n_done += n
         print(f"[ma_sem] frames {n_done:4d}/{T}  proposals={len(props):3d}  "
               f"instances={len(table)}  {n_done / (time.time() - t0):.1f} fps")
+        if hasattr(model.policy, "stats"):
+            info = model.policy.stats()
+            if info is not None:
+                print(f"[ma_sem]   h2o-kv: tokens/layer={info['kvcache_size'][0]}"
+                      f"  used={info['kvcache_used_mb']:.0f}MB"
+                      f"  prune={model.policy.prune_ms:.1f}ms")
 
     print(f"[ma_sem] streaming done ({time.time() - t0:.1f}s): {len(table)} instances")
     from ma_slam_semantic.export import export_all

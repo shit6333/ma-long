@@ -185,9 +185,17 @@ class SemConfig:
     filter_min_avg_objectness: float = 0.0
 
     # KV policy: 'none' (frozen-config default: flat KV, no pruning) | 'window'
+    # | 'h2o' (STAC-style temporal compression — pinned frame-0 + recent window
+    # + per-layer/per-head heavy-hitter tokens; bounded memory; plan S5).
     kv_policy: str = "none"
     kv_window_size: Optional[int] = None
     kv_keyframe_stride: Optional[int] = None
+    # h2o knobs (kv_policy='h2o'); budgets are in frames / frame-equivalents.
+    h2o_recent_frames: int = 8
+    h2o_hh_frames: int = 8
+    h2o_decay: float = 0.9                        # score decay γ (STAC 'temperature')
+    h2o_subsample: float = 1.0                    # query subsample for colsum scores
+    h2o_attn_backend: str = "triton"              # 'triton' | 'cuda' (attn-cuda ext)
     # KV reset valve (default OFF; log pose deltas regardless — measure first)
     kv_reset: bool = False
     kv_reset_delta: float = 0.5                   # max frame translation delta (m)

@@ -37,7 +37,7 @@ class SemanticModel:
         self.device = device or cfg.device
         self.model = load_model(cfg.model_args())      # builds + loads ckpt + cuda + eval
         self.kv = self.model.init_kv_cache()
-        self.policy = make_kv_policy(cfg)
+        self.policy = make_kv_policy(cfg, model=self.model)
         self._box_scale: Optional[torch.Tensor] = None  # [1] sequence-global scale
 
     # ------------------------------------------------------------------ scale
