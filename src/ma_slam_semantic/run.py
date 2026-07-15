@@ -92,13 +92,20 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     slam_cfg["submap_size"] = a.submap_size
     slam_cfg["Loop"]["enable"] = not a.no_loop
 
+    backend = None
+    if a.backend == "da3":
+        if "depth" in a.mode:
+            raise SystemExit("backend da3 supports rgb / rgb+intr only (no depth input)")
+        from model.da3_infer import Da3ChunkModel
+        backend = Da3ChunkModel(device="cuda")
+
     # GT trajectory: exports get SE3-Umeyama-aligned into the GT-mesh frame.
     gt_positions = None
     if a.gt:
         gt_positions = np.loadtxt(a.gt, comments="#").reshape(-1, 8)[:, 1:4]
 
     hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions)
-    slam = MaSlam(config=slam_cfg, model=None, hooks=hooks)
+    slam = MaSlam(config=slam_cfg, model=backend, hooks=hooks)
     res = slam.run(image_paths, a.out, mode=a.mode, depth_paths=depth_paths,
                    intrinsics=intrinsics, depth_scale=depth_scale,
                    depth_max=(a.depth_max if a.depth_max > 0 else None))
@@ -128,6 +135,8 @@ def main():
     # ma_slam-geometry mode args
     ap.add_argument("--mode", default="rgb+depth+intr",
                     help="[ma] ma_slam input mode (rgb / rgb+intr / rgb+depth / rgb+depth+intr)")
+    ap.add_argument("--backend", default="ma", choices=["ma", "da3"],
+                    help="[ma] reconstruction backbone: MapAnything | DA3 (rgb-only, metric)")
     ap.add_argument("--submap_size", type=int, default=20, help="[ma] frames per submap")
     ap.add_argument("--no_loop", action="store_true", help="[ma] disable loop closure")
     ap.add_argument("--depth_max", type=float, default=0.0, help="[ma] clamp far depth (m)")
