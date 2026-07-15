@@ -33,7 +33,7 @@ class SemanticHooks:
         # would shift the entire map (visible as depressed AP on drifty scenes).
         self.gt_positions = gt_positions
         self.model = SemanticModel(cfg, device=device)
-        self.bridge = SubmapBridge(cfg.resolution)
+        self.bridge = SubmapBridge(cfg.resolution, conf_gate_coef=cfg.conf_gate_coef)
         self.tracker = PoseTracker()
         self.resolver: Optional[SlamGeoResolver] = None
         self.table: Optional[InstanceTable] = None

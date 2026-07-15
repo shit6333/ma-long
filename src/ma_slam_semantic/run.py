@@ -132,10 +132,13 @@ def main():
     ap.add_argument("--no_loop", action="store_true", help="[ma] disable loop closure")
     ap.add_argument("--depth_max", type=float, default=0.0, help="[ma] clamp far depth (m)")
     ap.add_argument("--gt", default=None, help="[ma] GT trajectory for ATE report")
+    ap.add_argument("--conf_gate_coef", type=float, default=1.0,
+                    help="[ma] scale on the per-submap mean-conf validity gate "
+                         "(<1 keeps more points -> more coverage, noisier voxels)")
     a = ap.parse_args()
 
     if a.geometry == "ma":
-        cfg = SemConfig(box_scale_mode="first_chunk")
+        cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef)
         run_ma_slam(a, cfg)
         return
 

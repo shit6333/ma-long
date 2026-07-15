@@ -160,8 +160,9 @@ class SubmapBridge:
     ``Submap.conf_threshold``), gauge normalization, overlap-frame dedup.
     """
 
-    def __init__(self, res: Tuple[int, int] = (518, 336)):
+    def __init__(self, res: Tuple[int, int] = (518, 336), conf_gate_coef: float = 1.0):
         self.res = res
+        self.conf_gate_coef = conf_gate_coef            # scales the per-submap mean-conf gate
         self.T0_inv: Optional[np.ndarray] = None        # sequence gauge anchor
 
     def chunk(self, sm, graph) -> Dict:
@@ -176,7 +177,7 @@ class SubmapBridge:
             c2w.append(self.T0_inv @ G)
 
             P = _crop_resize_map(sm.frame_points_global(graph, i).astype(np.float32), self.res)
-            v = sm.conf[i] > sm.conf_threshold          # mean-conf gate (MA conf remap)
+            v = sm.conf[i] > sm.conf_threshold * self.conf_gate_coef   # mean-conf gate (MA conf remap)
             if sm.mask is not None:
                 v = v & sm.mask[i]
             v = _crop_resize_map(v.astype(np.uint8), self.res).astype(bool)

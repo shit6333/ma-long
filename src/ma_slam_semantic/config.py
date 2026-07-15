@@ -154,8 +154,11 @@ class SemConfig:
     voxel_size: float = 0.05
     # keep_mask gate on geometry conf. GT route: conf is 0/1 validity so any value in
     # (0,1] behaves the same (reference used 0.32 on da3 conf). MA route: MapAnything
-    # conf is NOT in (0,1) — the bridge substitutes a per-submap mean-conf gate.
+    # conf is NOT in (0,1) — the bridge substitutes a per-submap mean-conf gate,
+    # scaled by conf_gate_coef (1.0 = the ma_slam export default; LOWER keeps more
+    # points => more GT coverage at eval, at the cost of noisier voxels).
     point_conf_threshold: float = 0.32
+    conf_gate_coef: float = 1.0
 
     # instance matching (score = w_desc*cos + w_vox*iou + w_geo*exp(-d/sigma), hungarian)
     knn_radius: float = 1.0
