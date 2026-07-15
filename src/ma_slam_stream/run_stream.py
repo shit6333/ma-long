@@ -89,7 +89,7 @@ def _finalize(slam, out, n, elapsed, fps, vram, mode, compute_fps=None, compute_
 
 
 def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, dump_every,
-                viz=None):
+                viz=None, hooks=None):
     """Accumulate live keyframes into submaps and feed them to slam.process_submap.
 
     The producer (client / local source) already blur-selects AND runs the LK keyframe gate, so
@@ -136,6 +136,9 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
             loop_now = slam.stats["n_loops"]
             viz.update(slam, n_frames, loop_happened=loop_now > loops_seen[0])
             loops_seen[0] = loop_now
+            # Instance-colored semantic layer (hooks ran inside process_submap).
+            if hooks is not None and getattr(hooks, "table", None) is not None:
+                viz.update_instances(hooks.table, n_frames)
 
     try:
         for frame in source:                      # blocks until next frame / stop sentinel
@@ -166,6 +169,10 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
     wall_fps = n_frames / wall if wall > 0 else 0.0
     compute_fps = n_frames / compute_s[0] if compute_s[0] > 0 else 0.0
     vram = torch.cuda.max_memory_allocated() / 1e9 if cuda else 0.0
+    # Offline run() fires on_finish itself; the stream loop drives process_submap
+    # directly, so fire it here (final re-lift + merge + reference-format export).
+    if hooks is not None:
+        hooks.on_finish(slam.map, slam.graph)
     return _finalize(slam, out, n_frames, wall, wall_fps, vram, mode,
                      compute_fps=compute_fps, compute_s=compute_s[0])
 
@@ -207,6 +214,31 @@ def main():
                     help="[viz connect] running rerun viewer url, e.g. rr+http://LAPTOP_IP:9876")
     ap.add_argument("--viz_max_points", type=int, default=500_000,
                     help="cap on points logged to rerun (split across submaps)")
+
+    # ── semantic mapping (ma_slam_semantic hooks; v0 = synchronous per submap) ──
+    sp = ap.add_argument_group("semantic mapping")
+    sp.add_argument("--semantic", action="store_true",
+                    help="run the OpenSe3r query-instance semantic branch on every submap "
+                         "(SemanticHooks) — instance-colored voxels/bboxes in the viewer + "
+                         "reference-format instance export at stop. Adds ~0.6 s/frame of "
+                         "GPU work, so it bounds throughput on fast feeds (v0 is synchronous).")
+    sp.add_argument("--sem_chunk_size", type=int, default=4,
+                    help="frames per causal semantic forward (VRAM knob; results invariant)")
+    sp.add_argument("--conf_gate_coef", type=float, default=1.0,
+                    help="scale on the per-submap mean-conf validity gate (bridge)")
+    sp.add_argument("--kv_policy", default="h2o", choices=["none", "window", "h2o"],
+                    help="CausalBranch KV retention. Default 'h2o' — a live stream is "
+                         "unbounded, so the flat 'none' cache grows without limit "
+                         "(~60 MB/frame); h2o keeps it constant (~0.7 GB).")
+    sp.add_argument("--kv_window_size", type=int, default=None, help="[window] frames")
+    sp.add_argument("--kv_keyframe_stride", type=int, default=None, help="[window] stride")
+    sp.add_argument("--h2o_recent", type=int, default=8, help="[h2o] recent-window frames")
+    sp.add_argument("--h2o_hh", type=int, default=8, help="[h2o] heavy-hitter frame-equivalents")
+    sp.add_argument("--h2o_decay", type=float, default=0.9, help="[h2o] score decay γ")
+    sp.add_argument("--h2o_subsample", type=float, default=0.25,
+                    help="[h2o] query subsample for colsum scores (0.25 validated: "
+                         "AP par with full scores, colsum cost ~gone)")
+
     add_capture_args(ap)                          # --width/--height/--fps/--k/--enable_ir/... (local only)
     a = ap.parse_args()
 
@@ -254,11 +286,34 @@ def main():
 
     viz = make_viz(a.viz, a.viz_addr, conf_coef=a.conf_coef, max_points=a.viz_max_points)
 
-    slam = MaSlam(config=cfg, model=model, device=a.device)
+    # Semantic hooks (optional). Built BEFORE stream_loop so the semantic model's
+    # checkpoint load happens during startup, not after the READY banner.
+    hooks = None
+    if a.semantic:
+        from ma_slam_semantic.config import SemConfig
+        from ma_slam_semantic.hooks import SemanticHooks
+        sem_cfg = SemConfig(
+            box_scale_mode     = "first_chunk",
+            chunk_size         = a.sem_chunk_size,
+            conf_gate_coef     = a.conf_gate_coef,
+            kv_policy          = a.kv_policy,
+            kv_window_size     = a.kv_window_size,
+            kv_keyframe_stride = a.kv_keyframe_stride,
+            h2o_recent_frames  = a.h2o_recent,
+            h2o_hh_frames      = a.h2o_hh,
+            h2o_decay          = a.h2o_decay,
+            h2o_subsample      = a.h2o_subsample,
+        )
+        name = os.path.basename(os.path.normpath(a.out))
+        hooks = SemanticHooks(sem_cfg, a.out, name=name)
+        print(f"[ma_slam] semantic hooks armed (kv_policy={a.kv_policy}, "
+              f"chunk={a.sem_chunk_size}) — instance layer in viewer, export at stop")
+
+    slam = MaSlam(config=cfg, model=model, device=a.device, hooks=hooks)
     res = stream_loop(slam, source, a.out, mode=a.mode, intrinsics=intrinsics,
                       depth_scale=depth_scale,
                       depth_max=(a.depth_max if a.depth_max > 0 else None),
-                      dump_every=a.dump_every, viz=viz)
+                      dump_every=a.dump_every, viz=viz, hooks=hooks)
     print(f"[ma_slam] stream done: submaps={res['n_submaps']} loops={res['n_loops']} "
           f"fps={res['fps']:.2f} -> {res['poses_txt']}")
 

@@ -58,6 +58,26 @@ class RerunViz:
         # MapAnything poses are OpenCV right-down-forward.
         rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
+        # Blueprint: three independent, individually-toggleable layers —
+        #   world/points/**        RGB geometry cloud (per-submap children)
+        #   world/instances/voxels instance-colored semantic voxels
+        #   world/instances/boxes  instance bboxes — hidden by default (large
+        #                          floor/wall boxes occlude the scene; flip the
+        #                          eye icon in the entity tree to show them)
+        try:
+            import rerun.blueprint as rrb
+            rr.send_blueprint(rrb.Blueprint(
+                rrb.Spatial3DView(
+                    origin="world",
+                    overrides={
+                        "world/instances/boxes": rrb.EntityBehavior(visible=False),
+                    },
+                ),
+                collapse_panels=False,
+            ))
+        except Exception as e:                 # blueprint is cosmetic — never fatal
+            print(f"[viz] blueprint skipped ({e})")
+
     # ------------------------------------------------------------------ logging
     def _log_submap_points(self, sm, graph, budget):
         p, c = sm.world_points_and_colors(graph, conf_coef=self.conf_coef,
@@ -92,6 +112,89 @@ class RerunViz:
             self._log_submap_points(sm, slam.graph, budget)
             self._logged.add(sm.base_id)
         self._log_trajectory(slam)
+
+    # ------------------------------------------------------------------
+    # Semantic instance layer (ma_slam_semantic hooks)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _instance_color(inst_id: int) -> np.ndarray:
+        """Stable, well-separated per-id color (golden-ratio hue walk)."""
+        import colorsys
+        h = (inst_id * 0.61803398875) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, 0.75, 0.95)
+        return np.array([int(r * 255), int(g * 255), int(b * 255)], dtype=np.uint8)
+
+    def update_instances(self, table, n_frames: int, *,
+                         max_extent_m: float = 4.0,
+                         min_voxels: int = 5,
+                         stale_grace: int = 40,
+                         vote_min: int = 2,
+                         radius_scale: float = 0.25):
+        """Log the InstanceTable as an instance-colored voxel cloud + bboxes.
+
+        Cheap enough to re-log wholesale every submap (tens of thousands of
+        0.05 m voxel centers), which also keeps the view consistent with the
+        table's true state after loop closure: records re-lift lazily via the
+        M-signature machinery, so their voxels simply move on a later update
+        once re-observed — no special LC handling needed here.
+
+        Display-only denoising (the table itself is untouched — the export
+        applies the real re-lift/merge/filter at stop; these mirror its spirit
+        so the live view resembles the exported PLY):
+          * hide records larger than ``max_extent_m`` or with < ``min_voxels``
+          * hide single-observation records not re-seen within ``stale_grace``
+            key-steps (transient one-frame noise)
+          * for re-observed records, draw only voxels with votes >= ``vote_min``
+            (drops one-frame spurious voxels / pre-LC drift smear)
+        """
+        if table is None or len(table) == 0:
+            return
+        rr = self.rr
+        rr.set_time("frame", sequence=n_frames)
+        vs = float(table.voxel_size)
+        now = max((rec.last_seen for rec in table.records.values()), default=0)
+
+        pts, cols = [], []
+        box_centers, box_half, box_cols, labels = [], [], [], []
+        for iid, rec in table.records.items():
+            bmin = rec.bbox_min.numpy().astype(np.float32)
+            bmax = rec.bbox_max.numpy().astype(np.float32)
+            # -- display filter (mirrors the export noise filter's spirit) --
+            if float((bmax - bmin).max()) > max_extent_m:
+                continue
+            if len(rec.voxels) < min_voxels:
+                continue
+            if rec.count <= 1 and (now - rec.last_seen) > stale_grace:
+                continue
+            if rec.count >= 2:
+                vox = [v for v, n in rec.voxel_votes.items() if n >= vote_min]
+            else:
+                vox = list(rec.voxels)        # fresh singleton: show as-is
+            if not vox:
+                continue
+
+            c = self._instance_color(int(iid))
+            v = np.asarray(vox, dtype=np.float32)
+            pts.append((v + 0.5) * vs)
+            cols.append(np.repeat(c[None, :], len(v), axis=0))
+            box_centers.append((bmin + bmax) * 0.5)
+            box_half.append(np.maximum((bmax - bmin) * 0.5, 1e-3))
+            box_cols.append(c)
+            labels.append(str(int(iid)))
+
+        if pts:
+            rr.log("world/instances/voxels",
+                   rr.Points3D(np.concatenate(pts),
+                               colors=np.concatenate(cols),
+                               radii=vs * radius_scale))
+        if box_centers:
+            rr.log("world/instances/boxes",
+                   rr.Boxes3D(centers=np.stack(box_centers),
+                              half_sizes=np.stack(box_half),
+                              colors=np.stack(box_cols),
+                              labels=labels,
+                              show_labels=False))   # ids visible on hover/toggle
 
 
 def _primary_ip() -> str:
