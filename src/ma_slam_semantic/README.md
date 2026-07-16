@@ -76,7 +76,44 @@ python vendor/eval_instance_npz_scannet.py \
     --hdbscan_labels_npz outputs/ma_sem/005_golden/005_instance_labels.npz \
     --gt_scenenn_npz /tmp/scenenn_gt/005_scenenn_gt.npz \
     --benchmark_void --segment_snap --segs_json <segs> --snap_mesh_ply <mesh>
+
+# 機器人部署成品（traj json + 多層 instance table + 上色 per-point PLY）
+# 用法/參數/座標系規則詳見 ../ma_slam_stream/SEMANTIC_README.md §3
+python -m ma_slam_semantic.deploy --dir outputs/ma_sem/<scene> --name <scene>
 ```
+
+### 主要旋鈕
+
+| 旋鈕 | 預設 | 說明 |
+|---|---|---|
+| `--conf_gate_coef` | 1.0 | 幾何 validity gate（× submap 平均 conf）。**實務 inference 留 1.0**（擋不準的 pred geo）；**benchmark 報表用 0.5**（GT-mesh 覆蓋率計分下 5-scene mean AP 20.8→25.3）。效果 scene-specific：幾何乾淨的場景放鬆只會進雜訊。 |
+| `chunk_size` / `--sem_chunk_size` | 4 | 每次 causal forward 幀數，**純 VRAM 旋鈕**（結果不變）：4≈15GB、8≈26GB 峰值 |
+| `--kv_policy` | 離線 `none` / 串流 `h2o` | flat KV 成長 62MB/幀（1000 幀=61GB）；`h2o`（STAC：pinned frame0 + `--h2o_recent` 8 + heavy-hitter `--h2o_hh` 8、`--h2o_subsample 0.25` 已驗證 AP 持平）恆定 ~0.7GB |
+| `--no_loop` | off | LC 開著 instance map 會自癒（s0231：213 vs 240 instances） |
+
+### ScanNet 5-scene benchmark（inst SN200 + instsem）
+
+```bash
+# 每場景：--geometry ma --gt <gt_pose.txt>（輸出自動 Umeyama 對齊 GT-mesh 座標）
+# inst eval（唯一跑 SN200；protocol 固定帶這兩旗標，舊 summary 不可比）：
+python vendor/eval_instance_npz_scannet.py --hdbscan_labels_npz <out>/<sc>_instance_labels.npz \
+    --gt_ply scannet_200/<sc>/gt_scannet200_rawid_<sc>.ply \
+    --aggregation_json scannet_200/<sc>/<sc>.aggregation.json \
+    --segs_json scannet_200/<sc>/<sc>_vh_clean_2.0.010000.segs.json \
+    --benchmark 200 --benchmark_void --segment_snap
+# instsem（SN20+SN200，5 場景一次聚合；在 OpenSe3r repo 跑）：
+python query_instance_semantic.py --instance_labels_npz ... --instance_sem_queries_npz ... \
+    --benchmark 20 --backbone tips-v2-l14 --output_dir <out> --demo_name <sc>   # 逐場景廣播
+python tools/ovo_style_semantic_eval.py --dir_pattern '<outs>/{sc}' \
+    --backbone tips-v2-l14 --tasks instsem --benches sn20 sn200                  # 一次聚合
+```
+一鍵 driver 範本：`outputs/ma_sem/scannet5*/run_all.sh`。
+
+**結果（SN200 inst mean AP/AP50/AP25）**：MA(rgb+d+i) gate1.0 20.8/43.2/67.1、
+gate0.5 **25.3/50.5/73.9**；DA3(rgb) gate1.0 17.9/41.9/59.5、gate0.5 21.8/47.5/71.3。
+instsem 聚合 SN20 mIoU ~38-40（四配置持平——semantic eval 對覆蓋鈍感：無界 5-NN 眾數
+會把洞補成通常正確的 class；inst AP 則被覆蓋罰兩次，這是 gate 敏感度差異的機制）。
+0231 缺口分解：覆蓋 >> 漂移碎裂 >> eval bleed（詳見 git log `4b61284`）。
 
 ## OpenSe3r 依賴：vendor/（自帶版）
 
