@@ -102,6 +102,13 @@ class SemanticHooks:
             rmse = float(np.sqrt(np.mean(np.sum(((est @ R.T + t) - gt) ** 2, axis=1))))
             print(f"[sem_hooks] SE3-Umeyama align to GT ({len(fids)} frames): "
                   f"residual RMSE {rmse:.3f} m")
+            # persist so deploy.py can bring camera_poses.txt / combined_pcd.ply
+            # (SLAM frame) into the same frame as the instance npz/table.
+            import json
+            with open(os.path.join(self.out_dir, "alignment.json"), "w") as f:
+                json.dump({"T_align": T_align.tolist(),
+                           "note": "instance npz/table are in the GT-mesh frame; "
+                                   "apply T_align to SLAM-frame poses/points"}, f, indent=2)
         from ma_slam_semantic.export import export_all
         res = export_all(self.table, num_frames=self.n_frames,
                          out_dir=self.out_dir, name=self.name, cfg=self.cfg,

@@ -117,6 +117,10 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
         print(f"[ma_sem] Sim3-ATE={s['ate_rmse']:.4f} | SE3-ATE={se['ate_rmse']:.4f} | "
               f"loops={res['n_loops']}")
 
+    if getattr(a, "deploy", False):
+        from ma_slam_semantic.deploy import run_deploy
+        run_deploy(a.out, name)
+
 
 def main():
     ap = argparse.ArgumentParser(description="ma_slam_semantic runner")
@@ -160,6 +164,10 @@ def main():
                     help="[h2o] attention-score decay γ")
     ap.add_argument("--h2o_subsample", type=float, default=1.0,
                     help="[h2o] query subsample ratio for colsum scores")
+    ap.add_argument("--deploy", action="store_true",
+                    help="[ma] after SLAM+export, also write the robot artifact set "
+                         "(trajectory json, multi-level instance tables, inst/rgb/sem "
+                         "per-point PLYs) into <out>/deploy")
     a = ap.parse_args()
 
     kv_kwargs = dict(kv_policy=a.kv_policy,
