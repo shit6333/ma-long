@@ -402,12 +402,32 @@ class MaSlam:
                 self.loop_log.append(
                     f"BIDESCPAIRS q={cand.query_base}+{cand.query_frame} "
                     f"m={cand.match_base}+{cand.match_frame} {v.pairs_str()}")
+            lay = getattr(v, "layout", None)
+            if lay is not None:
+                lline = (f"BILAYOUT {tier} {lay.summary()} "
+                         f"q={cand.query_base}+{cand.query_frame} "
+                         f"m={cand.match_base}+{cand.match_frame} qimg={qimg} mimg={mimg}")
+                self.loop_log.append(lline)
+                print(f"[ma_slam] {lline}")
             if tier == "A":
                 if not veto:
                     continue                     # shadow bookkeeping only
-                # veto mode: FAIL raises the coloc bar to coloc_ratio_veto —
-                # a FAIL candidate must geometrically prove itself harder.
-                cv = inst.get("coloc_ratio_veto") if v.status == "FAIL" else None
+                # Stage 2 consumption: LVC / T_FAR are the cases where coloc has
+                # NO discriminating power (rotation-blind position check accepted
+                # all 8 GT-false edges of these types) -> hard reject, no coloc.
+                s2 = getattr(v, "layout", None)
+                if s2 is not None and s2.status in ("LARGE_VIEW_CHANGE", "T_FAR", "M_LOW"):
+                    line = (f"S2GATE REJECT {s2.status} "
+                            f"q={cand.query_base}+{cand.query_frame} "
+                            f"m={cand.match_base}+{cand.match_frame} "
+                            f"qimg={qimg} mimg={mimg}")
+                    self.loop_log.append(line)
+                    print(f"[ma_slam] {line}")
+                    continue
+                # FAIL (either stage) raises the coloc bar to coloc_ratio_veto —
+                # the candidate must geometrically prove itself harder.
+                fail = v.status == "FAIL" or (s2 is not None and s2.status == "FAIL")
+                cv = inst.get("coloc_ratio_veto") if fail else None
                 if self._add_loop_constraint(sm, cand, coloc_max=cv):
                     self._unopt_loop_edges += 1
                 continue

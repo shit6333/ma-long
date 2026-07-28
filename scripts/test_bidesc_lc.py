@@ -99,5 +99,62 @@ D = lookup_descs(ids + [(99, 0.5)], records)                    # 99 missing -> 
 check("lookup shape", D.shape, (3, 256))
 check("lookup normalized", bool(abs(np.linalg.norm(D[0]) - 1) < 1e-5), True)
 
+
+
+# --------------------------------------------------------------------- stage 2
+print("verify_layout():")
+from ma_slam_semantic.bidesc_lc import verify_layout
+
+def rot(deg, axis=np.array([0, 1, 0.0])):
+    axis = axis / np.linalg.norm(axis)
+    t = np.radians(deg)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(t) * K + (1 - np.cos(t)) * K @ K
+
+P = np.array([[0.5, 0.2, 2.0], [-0.6, 0.1, 2.5], [0.1, -0.4, 3.2], [0.9, 0.5, 1.5]])
+
+# 1. same view (small noise) -> PASS
+v = verify_layout(P, P + rng.normal(0, 0.02, P.shape), CFG)
+check("layout same view", v.status, "PASS")
+
+# 2. pure camera rotation 30deg (about the CAMERA origin: X_q = R X_r, t*=0)
+#    NB: rotating points about their own centroid instead would mean the camera
+#    ORBITS the cluster -> real displacement -> T_FAR would be correct there.
+v = verify_layout(P @ rot(30).T, P, CFG)
+check("layout 30deg", v.status, "PASS")
+check("layout 30deg thetaR", bool(abs(v.theta_r - 30) < 6), True)
+
+# 3. pure camera rotation 120deg -> LARGE_VIEW_CHANGE (Ed=0, ER=0, theta >> tau)
+v = verify_layout(P @ rot(120).T, P, CFG)
+check("layout 120deg", v.status, "LARGE_VIEW_CHANGE")
+
+# 4. scrambled correspondence -> rejected (Ed blows up; t* is garbage too, so
+#    either FAIL or T_FAR is a correct rejection under the tnorm-first ordering)
+v = verify_layout(P, P[[2, 0, 3, 1]] * np.array([1.4, 0.7, 1.2]), CFG)
+check("layout scrambled rejected", v.status in ("FAIL", "T_FAR"), True)
+
+# 5. common scale offset x1.3: doc's Ed = |log 1.3| = 0.26 <= 0.4 -> PASSES
+#    (documents that Ed-as-specified tolerates uniform scale drift up to e^tau_d)
+v = verify_layout(P, P * 1.3, CFG)
+check("layout scale x1.3 (doc Ed tolerates)", v.status, "PASS")
+check("layout scale diag Escale", bool(abs(v.e_scale + np.log(1.3)) < 0.02), True)
+
+# 6. translation-only false loop (teddy-type): edge metrics blind, but the
+#    calibrated ||t*|| gate catches it (t* estimates the camera displacement)
+v = verify_layout(P, P + np.array([1.0, 0, 0]), CFG)
+check("layout translation-only -> T_FAR", v.status, "T_FAR")
+check("layout translation t_norm~1.0", bool(abs(v.t_norm - 1.0) < 0.05), True)
+
+# 6b. M=3 wild-rotation estimate on a REAL loop: rotation abstains below
+#     s2_min_m_rot, distance-only ruling keeps it (the plant 879/1014 fix)
+v = verify_layout(P[:3] @ rot(120).T, P[:3], CFG)
+check("layout M=3 rotation abstains", v.status, "PASS")
+check("layout M=3 reason", v.reason, "rot-abstain")
+
+# 7. M<=2 -> M_LOW hard reject (1-2 co-visible objects can't support a verdict:
+#    M=1 has zero edges, M=2's single edge is chance-consistent too easily)
+check("layout M=1 -> M_LOW", verify_layout(P[:1], P[:1], CFG).status, "M_LOW")
+check("layout M=2 -> M_LOW", verify_layout(P[:2], P[:2], CFG).status, "M_LOW")
+
 print(f"\n{'ALL PASS' if not FAILED else f'{len(FAILED)} FAILED: {FAILED}'}")
 sys.exit(1 if FAILED else 0)

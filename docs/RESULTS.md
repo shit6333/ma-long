@@ -55,6 +55,32 @@ keyframes (= VGGT-SLAM's `w`); Sim3-ATE (their protocol). SE3-avg (metric): MA-r
   *worsens* the metric (SE3 0.305, scale 0.6–0.9); only depth fixes it (SE3 0.042). Judge these with SE3.
 - **Weak spot = `360`** (pure rotation → no triangulation baseline) across all configs — an inherent backbone limit.
 
+## Semantic loop-closure verification (Bi-Desc S1 + Layout-Graph S2)
+
+Two-stage instance-level verification of SALAD loop candidates (branch `semantic`;
+`--sem_lc veto`), sitting between retrieval and the coloc geometric check — the same slot
+where VGGT-SLAM 2.0 adds its attention-based verifier, but using the semantic-mapping
+branch's instance descriptors + camera-frame instance layouts (zero extra model forwards).
+S1 = bidirectional descriptor verification (a FAIL raises the coloc bar 0.70→0.45);
+S2 = layout-graph comparison (E_d distance consistency, theta_R common rotation via
+Wahba, ||t*|| implied camera displacement) with hard rejects for LARGE_VIEW_CHANGE /
+T_FAR / M_LOW (<=2 co-visible instances). Also includes the submap-0 retrieval fix
+(back-to-start loops were unretrievable since inception — improves the base rows too).
+
+Sim3-ATE @ submap 32 (same protocol as the table above; base = post-fix DA3-rgb):
+
+| method | 360 | desk | desk2 | floor | plant | room | rpy | teddy | xyz | **avg** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| VGGT-SLAM 2.0 | 0.050 | 0.025 | 0.029 | 0.102 | 0.026 | 0.063 | 0.026 | 0.038 | 0.014 | 0.041 |
+| ours base (post-fix) | 0.095 | 0.030 | 0.023 | 0.183 | 0.040 | 0.043 | 0.025 | 0.052 | 0.010 | 0.056 |
+| ours + S1 | 0.095 | 0.030 | 0.023 | 0.145 | 0.043 | 0.043 | 0.025 | 0.052 | 0.010 | 0.052 |
+| **ours + S1+S2** | **0.049** | 0.030 | 0.023 | **0.069** | 0.046 | 0.043 | 0.025 | 0.049 | 0.010 | **0.038** |
+
+At submap 20: base 0.053 → +S1 0.044 → +S1+S2 **0.040**. Both submap sizes beat
+VGGT-SLAM 2.0's 0.041 from RGB only; per-scene 6W/1T/2L at w32. GT-audited hard rejects:
+20 confirmed-false edges removed for 2 thin-evidence real ones (M<=2, redundant loops
+covered the same revisits). Full run logs under `outputs/sem_lc_shadow/`.
+
 **Takeaway:** building on VGGT-SLAM's submap + factor-graph recipe, ma_slam shows a *flexible* SLAM that
 works directly on **metric** scale (plain SE(3), no projective SL(4)) and is **backbone-agnostic**
 (MapAnything / DA3, RGB → RGB+depth+intr), reaching results **competitive** with the strongest

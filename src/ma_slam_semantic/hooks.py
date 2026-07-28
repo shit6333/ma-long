@@ -14,13 +14,15 @@ from __future__ import annotations
 import os
 from typing import List, Optional, Tuple
 
+import numpy as np
+
 from ma_slam_semantic.config import SemConfig
 from ma_slam_semantic.bridge import SubmapBridge, PoseTracker
 from ma_slam_semantic.sem_model import SemanticModel
 from ma_slam_semantic.proposals import make_proposals
 from ma_slam_semantic.instance_map import InstanceTable, SlamGeoResolver
 from ma_slam_semantic.bidesc_lc import (BiDescConfig, BiDescVerdict, FrameIndex,
-                                        lookup_descs, verify as bidesc_verify)
+                                        verify as bidesc_verify, verify_layout)
 
 
 class SemanticHooks:
@@ -68,16 +70,28 @@ class SemanticHooks:
             props, pix_map, _ = make_proposals(out, sub, self.cfg)
             assign = self.table.match_chunk(props, sub["frame_keys"], pix_map)
             paths = [sm.image_paths[i] for i in sub["frame_idx"]]
+            # Camera-frame 3D centres for Stage-2 layout graphs: undo the frame's
+            # global pose so the stored position is a pure per-frame observation
+            # (drift-free, healing-independent). Per-axis median doesn't strictly
+            # commute with rotation, but at voxel-centroid noise level it's fine.
+            inv_G = {i: np.linalg.inv(sm.frame_pose_global(graph, i))
+                     for i in sub["frame_idx"]}
             per_frame: dict = {}
             for k, p in enumerate(props):
                 if assign[k] >= 0:
                     d = p["descriptor"]
-                    per_frame.setdefault(int(p["frame"]), []).append(
+                    t = int(p["frame"])
+                    c = p["center"].detach().cpu().numpy().astype(np.float64)
+                    T = inv_G[sub["frame_idx"][t]]
+                    c_cam = (T[:3, :3] @ c + T[:3, 3]).astype(np.float32)
+                    per_frame.setdefault(t, []).append(
                         ((assign[k], float(p.get("objectness", 0.0))),
-                         d.detach().cpu().numpy() if hasattr(d, "detach") else d))
+                         d.detach().cpu().numpy() if hasattr(d, "detach") else d,
+                         c_cam))
             for t, rows in per_frame.items():
                 self.frame_index.add(paths[t], [r[0] for r in rows],
-                                     descs=[r[1] for r in rows])
+                                     descs=[r[1] for r in rows],
+                                     centers=[r[2] for r in rows])
             n_props += len(props)
         self.n_frames += len(chunk["frame_keys"])
         print(f"[sem_hooks] submap {sm.base_id}: +{len(chunk['frame_keys'])} frames, "
@@ -103,14 +117,38 @@ class SemanticHooks:
         # history side is always the map's running mean (it IS the memory); the
         # current side is either the same lookup ('map') or the frame's raw
         # proposal descriptors ('proposal' — independent of the association layer).
+        # ``rows`` maps each descriptor row back to its FrameIndex row so the
+        # Stage-2 centres stay aligned even when a lookup skips a missing id.
+        def _lookup(ids):
+            ds, rows = [], []
+            for k, (iid, _) in enumerate(ids):
+                rec = self.table.records.get(iid)
+                if rec is None:
+                    continue
+                d = rec.descriptor.numpy().astype(np.float32)
+                ds.append(d / (np.linalg.norm(d) + 1e-12))
+                rows.append(k)
+            return (np.stack(ds) if ds else np.zeros((0, 256), np.float32)), rows
+
         if self.lc_cfg.desc_src == "proposal":
             D_q = self.frame_index.get_descs(q_path)
+            q_rows = list(range(len(D_q))) if D_q is not None else []
             if D_q is None or len(D_q) != len(ids_q):
-                D_q = lookup_descs(ids_q, self.table.records)   # pre-switch frames
+                D_q, q_rows = _lookup(ids_q)                    # pre-switch frames
         else:
-            D_q = lookup_descs(ids_q, self.table.records)
-        D_r = lookup_descs(ids_r, self.table.records)
-        return bidesc_verify(D_q, D_r, self.lc_cfg)
+            D_q, q_rows = _lookup(ids_q)
+        D_r, r_rows = _lookup(ids_r)
+        v = bidesc_verify(D_q, D_r, self.lc_cfg)
+
+        # Stage 2 (shadow): layout graphs over the Stage-1 unique matches.
+        C_q = self.frame_index.get_centers(q_path)
+        C_r = self.frame_index.get_centers(m_path)
+        if C_q is not None and C_r is not None and v.pairs:
+            uniq = [(q_rows[p["q"]], r_rows[p["r"]]) for p in v.pairs if p["uniq"]]
+            if uniq:
+                qi, ri = zip(*uniq)
+                v.layout = verify_layout(C_q[list(qi)], C_r[list(ri)], self.lc_cfg)
+        return v
 
     def on_loop(self, key_new: int, key_old: int) -> None:
         # Healing is handled by the M-signature mechanism (stale records re-lift
