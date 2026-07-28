@@ -42,13 +42,14 @@ check("same set nuniq", v.n_uniq, 6)
 v = verify(make(5), make(5), CFG)
 check("disjoint sets", v.status, "FAIL")
 
-# 3. asymmetric: history is subset of current (3 of 8 shared) — harmonic penalizes
-Dq = np.concatenate([noisy(D6[:3]), make(5)])            # 8 current, 3 shared
-Dr = D6[:3]                                              # 3 historical, all shared
-v = verify(Dq, Dr, CFG)
-# a_rq high (all history explained), a_qr diluted by 5 novel instances but topK
-# picks the strongest -> still passes; the point is it does NOT fail on asymmetry
-check("subset overlap", v.status, "PASS")
+# 3. asymmetric: history is a subset of current. top-K is adaptive (K=clip(ceil(n/2),2,4)),
+# so when the shared count is BELOW K the average pulls in an unmatched row and the
+# directional score drops — at the calibrated tau=0.85 that means FAIL for 3-of-8 but
+# PASS once the shared count reaches K.
+Dq = np.concatenate([noisy(D6[:3]), make(5)])            # 8 current, 3 shared, K_q=4
+check("subset overlap 3-of-8 (shared < K)", verify(Dq, D6[:3], CFG).status, "FAIL")
+Dq = np.concatenate([noisy(D6[:4]), make(4)])            # 8 current, 4 shared, K_q=4
+check("subset overlap 4-of-8 (shared >= K)", verify(Dq, D6[:4], CFG).status, "PASS")
 
 # 4. one-sided support only: current has 1 shared + 7 novel, history 1 shared + 5 novel
 Dq = np.concatenate([noisy(D6[:1]), make(7)])

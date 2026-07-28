@@ -265,6 +265,8 @@ def main():
                     help="bidesc: min unique MNN matches for PASS")
     sp.add_argument("--bd_kbag", type=int, default=16,
                     help="bidesc: per-frame instance-id cap (by objectness)")
+    sp.add_argument("--bd_desc_src", default="proposal", choices=["map", "proposal"],
+                     help="bidesc current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs (association-independent)")
     sp.add_argument("--sem_lc_coloc", type=float, default=0.50,
                     help="stricter coloc gate for tier-B edges; <=0 uses coloc_ratio")
 
@@ -342,7 +344,8 @@ def main():
         name = os.path.basename(os.path.normpath(a.out))
         from ma_slam_semantic.bidesc_lc import BiDescConfig
         lc_cfg = BiDescConfig(n_min=a.bd_nmin, tau_pair=a.bd_pair, tau_dir=a.bd_dir,
-                              tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag)
+                              tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag,
+                              desc_src=a.bd_desc_src)
         hooks = SemanticHooks(sem_cfg, a.out, name=name, lc_cfg=lc_cfg)
         print(f"[ma_slam] semantic hooks armed (kv_policy={a.kv_policy}, "
               f"chunk={a.sem_chunk_size}, sem_lc={a.sem_lc}) — instance layer in "

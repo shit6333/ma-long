@@ -1,11 +1,15 @@
 """Bi-Desc LC (v2) — bidirectional instance-descriptor verification of SALAD loop
 candidates, VGGT-SLAM-2.0-inspired redesign of instance_lc (which is retired).
 
-Per-frame storage is just the GLOBAL INSTANCE IDS the frame's proposals were
-associated to (``FrameIndex``); descriptors are looked up at verify time from the
-InstanceTable's running-mean memory — no per-frame descriptor bags, no extra
-model forward, no area filtering (debug-friendly: what the model proposes is
-what the gate sees, capped at ``k_bag`` by objectness).
+Per-frame storage is the instance IDs a frame's proposals were associated to plus
+(by default) their raw descriptors — no extra model forward, no area filtering
+(what the model proposes is what the gate sees, capped at ``k_bag`` by objectness).
+The CURRENT side uses those raw proposal descriptors and the HISTORY side the
+InstanceTable's running mean, so every score is a genuine cross-frame descriptor
+similarity. Looking BOTH sides up by id (``desc_src='map'``) is kept as an
+ablation, but measured 92% of its counted pairs at exactly 1.00 — both ids resolve
+to the same vector, degenerating the test into an id intersection that inherits
+the association layer's decisions (55% of whose weight is geometry).
 
 Verdict (three-state, shadow-first):
   S = D_q D_r^T (cosine); directional scores a_qr / a_rq = mean of the top-K row/
@@ -40,6 +44,19 @@ class BiDescConfig:
     k_frac: float = 0.5
     k_bag: int = 16         # per-frame id cap (by objectness); no area filtering
     eps: float = 1e-6
+    # Descriptor source for the CURRENT side.
+    #   'map'      — look the frame's instance ids up in InstanceTable (running mean).
+    #                Measured: 92% of counted pairs then score exactly 1.00 because both
+    #                sides resolve to the SAME id, i.e. the test degenerates into an
+    #                id-intersection that inherits match_chunk's decisions (which are
+    #                55% geometry: w_vox .3 + w_geo .25 vs w_desc .3).
+    #   'proposal' — use the frame's RAW proposal descriptors. Every score is then a
+    #                genuine cross-frame descriptor similarity, independent of the
+    #                association layer — so the gate still works when large drift made
+    #                match_chunk spawn new ids instead of merging (exactly the loops
+    #                that matter most). Costs ~16 KB/frame of storage.
+    # The history side always uses the map's running mean (it IS the memory).
+    desc_src: str = "proposal"
 
 
 def adaptive_k(n: int, cfg: BiDescConfig) -> int:
@@ -49,18 +66,36 @@ def adaptive_k(n: int, cfg: BiDescConfig) -> int:
 # --------------------------------------------------------------------------- storage
 class FrameIndex:
     """path -> [(inst_id, objectness)] recorded at mapping time (Obs-equivalent
-    provenance, inverted). The ONLY per-frame storage of v2 (~bytes per frame)."""
+    provenance, inverted) — bytes per frame.
 
-    def __init__(self, k_bag: int = 16):
+    With ``keep_desc`` it additionally retains each frame's RAW proposal
+    descriptors (~16 KB/frame at k_bag=16), which ``desc_src='proposal'`` needs:
+    the raw vectors are otherwise dropped right after ``match_chunk`` (only the
+    per-instance running mean survives, inside InstanceRecord)."""
+
+    def __init__(self, k_bag: int = 16, keep_desc: bool = False):
         self.k_bag = k_bag
+        self.keep_desc = keep_desc
         self._ids: Dict[str, List[Tuple[int, float]]] = {}
+        self._descs: Dict[str, np.ndarray] = {}          # path -> (K,256) L2-normed
 
-    def add(self, path: str, items: Sequence[Tuple[int, float]]) -> None:
-        kept = sorted(items, key=lambda t: -t[1])[: self.k_bag]
-        self._ids[path] = [(int(i), float(o)) for i, o in kept]
+    def add(self, path: str, items: Sequence[Tuple[int, float]],
+            descs: Optional[Sequence[np.ndarray]] = None) -> None:
+        """``items[i]`` = (inst_id, objectness); ``descs[i]`` = that proposal's raw
+        descriptor (same order). Both are truncated to the same top-k_bag subset."""
+        order = sorted(range(len(items)), key=lambda i: -items[i][1])[: self.k_bag]
+        self._ids[path] = [(int(items[i][0]), float(items[i][1])) for i in order]
+        if self.keep_desc and descs is not None:
+            D = np.stack([np.asarray(descs[i], np.float32) for i in order]) \
+                if order else np.zeros((0, 256), np.float32)
+            D /= (np.linalg.norm(D, axis=1, keepdims=True) + 1e-12)
+            self._descs[path] = D
 
     def get(self, path: str) -> Optional[List[Tuple[int, float]]]:
         return self._ids.get(path)
+
+    def get_descs(self, path: str) -> Optional[np.ndarray]:
+        return self._descs.get(path)
 
     def __len__(self):
         return len(self._ids)

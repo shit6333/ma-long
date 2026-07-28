@@ -132,7 +132,8 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
 
     from ma_slam_semantic.bidesc_lc import BiDescConfig
     lc_cfg = BiDescConfig(n_min=a.bd_nmin, tau_pair=a.bd_pair, tau_dir=a.bd_dir,
-                          tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag)
+                          tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag,
+                          desc_src=a.bd_desc_src)
     hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions,
                           lc_cfg=lc_cfg)
     slam = MaSlam(config=slam_cfg, model=backend, hooks=hooks)
@@ -201,6 +202,8 @@ def main():
                     help="[ma] bidesc: min unique MNN matches for PASS")
     ap.add_argument("--bd_kbag", type=int, default=16,
                     help="[ma] bidesc: per-frame instance-id cap (by objectness)")
+    ap.add_argument("--bd_desc_src", default="proposal", choices=["map", "proposal"],
+                     help="bidesc current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs (association-independent)")
     ap.add_argument("--sem_lc_coloc", type=float, default=0.50,
                     help="[ma] stricter coloc gate for tier-B edges (weak SALAD "
                          "prior needs stronger geometry); <=0 uses coloc_ratio")

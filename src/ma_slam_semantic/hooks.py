@@ -46,7 +46,8 @@ class SemanticHooks:
         # descriptors are looked up from the table's running-mean memory at verify
         # time. Queried by the solver via verify_loop_candidate.
         self.lc_cfg = lc_cfg or BiDescConfig()
-        self.frame_index = FrameIndex(k_bag=self.lc_cfg.k_bag)
+        self.frame_index = FrameIndex(k_bag=self.lc_cfg.k_bag,
+                                      keep_desc=(self.lc_cfg.desc_src == "proposal"))
 
     # ------------------------------------------------------------------ hooks
     def on_submap(self, sm, gmap, graph) -> None:
@@ -70,10 +71,13 @@ class SemanticHooks:
             per_frame: dict = {}
             for k, p in enumerate(props):
                 if assign[k] >= 0:
+                    d = p["descriptor"]
                     per_frame.setdefault(int(p["frame"]), []).append(
-                        (assign[k], float(p.get("objectness", 0.0))))
-            for t, items in per_frame.items():
-                self.frame_index.add(paths[t], items)
+                        ((assign[k], float(p.get("objectness", 0.0))),
+                         d.detach().cpu().numpy() if hasattr(d, "detach") else d))
+            for t, rows in per_frame.items():
+                self.frame_index.add(paths[t], [r[0] for r in rows],
+                                     descs=[r[1] for r in rows])
             n_props += len(props)
         self.n_frames += len(chunk["frame_keys"])
         print(f"[sem_hooks] submap {sm.base_id}: +{len(chunk['frame_keys'])} frames, "
@@ -96,7 +100,15 @@ class SemanticHooks:
                                  n_q=0 if not ids_q else len(ids_q),
                                  n_r=0 if not ids_r else len(ids_r),
                                  reason="no frame index")
-        D_q = lookup_descs(ids_q, self.table.records)
+        # history side is always the map's running mean (it IS the memory); the
+        # current side is either the same lookup ('map') or the frame's raw
+        # proposal descriptors ('proposal' — independent of the association layer).
+        if self.lc_cfg.desc_src == "proposal":
+            D_q = self.frame_index.get_descs(q_path)
+            if D_q is None or len(D_q) != len(ids_q):
+                D_q = lookup_descs(ids_q, self.table.records)   # pre-switch frames
+        else:
+            D_q = lookup_descs(ids_q, self.table.records)
         D_r = lookup_descs(ids_r, self.table.records)
         return bidesc_verify(D_q, D_r, self.lc_cfg)
 
