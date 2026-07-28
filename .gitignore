@@ -36,3 +36,6 @@ CLAUDE.local.md
 
 # vendored OpenSe3r weights (14 GB; code is committed, weights are not)
 vendor/weights/
+
+# Bundled weights archive (13 GB — download per INSTALL.md)
+weights.zip

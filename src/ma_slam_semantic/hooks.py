@@ -19,11 +19,14 @@ from ma_slam_semantic.bridge import SubmapBridge, PoseTracker
 from ma_slam_semantic.sem_model import SemanticModel
 from ma_slam_semantic.proposals import make_proposals
 from ma_slam_semantic.instance_map import InstanceTable, SlamGeoResolver
+from ma_slam_semantic.bidesc_lc import (BiDescConfig, BiDescVerdict, FrameIndex,
+                                        lookup_descs, verify as bidesc_verify)
 
 
 class SemanticHooks:
     def __init__(self, cfg: SemConfig, out_dir: str, name: str = "scene",
-                 device: Optional[str] = None, gt_positions=None):
+                 device: Optional[str] = None, gt_positions=None,
+                 lc_cfg: Optional[BiDescConfig] = None):
         self.cfg = cfg
         self.out_dir = out_dir
         self.name = name
@@ -39,6 +42,11 @@ class SemanticHooks:
         self.table: Optional[InstanceTable] = None
         self.loop_events: List[Tuple[int, int]] = []
         self.n_frames = 0
+        # Bi-Desc LC (v2): per-frame storage is just the associated instance IDS;
+        # descriptors are looked up from the table's running-mean memory at verify
+        # time. Queried by the solver via verify_loop_candidate.
+        self.lc_cfg = lc_cfg or BiDescConfig()
+        self.frame_index = FrameIndex(k_bag=self.lc_cfg.k_bag)
 
     # ------------------------------------------------------------------ hooks
     def on_submap(self, sm, gmap, graph) -> None:
@@ -57,17 +65,40 @@ class SemanticHooks:
         for sub in split_chunk(chunk, self.cfg.chunk_size):
             out = self.model.forward_chunk(sub)
             props, pix_map, _ = make_proposals(out, sub, self.cfg)
-            self.table.match_chunk(props, sub["frame_keys"], pix_map)
+            assign = self.table.match_chunk(props, sub["frame_keys"], pix_map)
+            paths = [sm.image_paths[i] for i in sub["frame_idx"]]
+            per_frame: dict = {}
+            for k, p in enumerate(props):
+                if assign[k] >= 0:
+                    per_frame.setdefault(int(p["frame"]), []).append(
+                        (assign[k], float(p.get("objectness", 0.0))))
+            for t, items in per_frame.items():
+                self.frame_index.add(paths[t], items)
             n_props += len(props)
         self.n_frames += len(chunk["frame_keys"])
         print(f"[sem_hooks] submap {sm.base_id}: +{len(chunk['frame_keys'])} frames, "
-              f"{n_props} proposals -> {len(self.table)} instances")
+              f"{n_props} proposals -> {len(self.table)} instances "
+              f"| lc-index {len(self.frame_index)}")
         if hasattr(self.model.policy, "stats"):
             info = self.model.policy.stats()
             if info is not None:
                 print(f"[sem_hooks]   h2o-kv: tokens/layer={info['kvcache_size'][0]}"
                       f"  used={info['kvcache_used_mb']:.0f}MB"
                       f"  prune={self.model.policy.prune_ms:.1f}ms")
+
+    def verify_loop_candidate(self, q_path: str, m_path: str):
+        """Bi-Desc verdict for a SALAD loop candidate (solver-initiated; read-only).
+        UNKNOWN when either frame has no recorded ids / too few instances."""
+        ids_q = self.frame_index.get(q_path)
+        ids_r = self.frame_index.get(m_path)
+        if not ids_q or not ids_r or self.table is None:
+            return BiDescVerdict("UNKNOWN",
+                                 n_q=0 if not ids_q else len(ids_q),
+                                 n_r=0 if not ids_r else len(ids_r),
+                                 reason="no frame index")
+        D_q = lookup_descs(ids_q, self.table.records)
+        D_r = lookup_descs(ids_r, self.table.records)
+        return bidesc_verify(D_q, D_r, self.lc_cfg)
 
     def on_loop(self, key_new: int, key_old: int) -> None:
         # Healing is handled by the M-signature mechanism (stale records re-lift
@@ -79,6 +110,12 @@ class SemanticHooks:
         if self.table is None:
             return
         import numpy as np
+        if len(self.frame_index):
+            ns = np.array([len(v) for v in self.frame_index._ids.values()])
+            print(f"[sem_hooks] lc-index: {len(self.frame_index)} frames, ids/frame "
+                  f"p10={np.percentile(ns,10):.0f} p50={np.percentile(ns,50):.0f} "
+                  f"p90={np.percentile(ns,90):.0f} | frames<{self.lc_cfg.n_min}: "
+                  f"{(ns < self.lc_cfg.n_min).mean()*100:.0f}%")
         T_align = None
         if self.gt_positions is not None:
             from eval import umeyama_sim3

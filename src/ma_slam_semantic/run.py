@@ -88,9 +88,40 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     if ("intr" in a.mode) or need_depth:
         intrinsics = load_intrinsics(os.path.join(a.data, "intrinsic.txt"))
 
+    # LK keyframe gate (mirrors ma_slam.run, default ON): drop low-parallax frames so
+    # submap_size counts keyframes. GT for ATE eval is subsampled to the same keyframes
+    # (per-index correspondence); hooks' gt_positions stays the FULL array — Submap
+    # frame_ids are parsed from filenames, so original ordinals survive the subset.
+    gt_positions = None
+    if a.gt:
+        gt_positions = np.loadtxt(a.gt, comments="#").reshape(-1, 8)[:, 1:4]
+    if a.keyframe_disparity > 0:
+        from ma_slam.keyframe_flow import select_keyframes_by_disparity
+        kf = select_keyframes_by_disparity(image_paths, a.keyframe_disparity)
+        print(f"[ma_sem] keyframe gate: kept {len(kf)}/{len(image_paths)} frames "
+              f"(disparity > {a.keyframe_disparity:g}px)")
+        image_paths = [image_paths[i] for i in kf]
+        if depth_paths is not None:
+            depth_paths = [depth_paths[i] for i in kf]
+        if a.gt:
+            gt_lines = [ln for ln in open(a.gt) if ln.strip() and not ln.startswith("#")]
+            os.makedirs(a.out, exist_ok=True)
+            kf_gt = os.path.join(a.out, "gt_kf.txt")
+            with open(kf_gt, "w") as f:
+                f.write("# timestamp tx ty tz qx qy qz qw\n")
+                f.write("".join(gt_lines[i] for i in kf))
+            a.gt = kf_gt
+
     slam_cfg = copy.deepcopy(DEFAULT_CONFIG)
     slam_cfg["submap_size"] = a.submap_size
     slam_cfg["Loop"]["enable"] = not a.no_loop
+    slam_cfg["Loop"]["half_window"] = a.loop_half_window
+    slam_cfg["Loop"]["rot_max_deg"] = a.rot_max_deg
+    slam_cfg["Loop"]["Instance"].update(
+        enable=(a.sem_lc != "off"), shadow=(a.sem_lc not in ("enforce", "veto")),
+        veto=(a.sem_lc == "veto"),
+        tier_b_floor=a.sem_lc_floor, max_tier_b=a.sem_lc_max,
+        coloc_ratio_b=(a.sem_lc_coloc if a.sem_lc_coloc > 0 else None))
 
     backend = None
     if a.backend == "da3":
@@ -99,12 +130,11 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
         from model.da3_infer import Da3ChunkModel
         backend = Da3ChunkModel(device="cuda")
 
-    # GT trajectory: exports get SE3-Umeyama-aligned into the GT-mesh frame.
-    gt_positions = None
-    if a.gt:
-        gt_positions = np.loadtxt(a.gt, comments="#").reshape(-1, 8)[:, 1:4]
-
-    hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions)
+    from ma_slam_semantic.bidesc_lc import BiDescConfig
+    lc_cfg = BiDescConfig(n_min=a.bd_nmin, tau_pair=a.bd_pair, tau_dir=a.bd_dir,
+                          tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag)
+    hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions,
+                          lc_cfg=lc_cfg)
     slam = MaSlam(config=slam_cfg, model=backend, hooks=hooks)
     res = slam.run(image_paths, a.out, mode=a.mode, depth_paths=depth_paths,
                    intrinsics=intrinsics, depth_scale=depth_scale,
@@ -143,6 +173,37 @@ def main():
                     help="[ma] reconstruction backbone: MapAnything | DA3 (rgb-only, metric)")
     ap.add_argument("--submap_size", type=int, default=20, help="[ma] frames per submap")
     ap.add_argument("--no_loop", action="store_true", help="[ma] disable loop closure")
+    ap.add_argument("--rot_max_deg", type=float, default=0.0,
+                    help="[ma] reject loop candidates above this graph-estimated relative rotation (0 = off)")
+    ap.add_argument("--loop_half_window", type=int, default=0,
+                    help="[ma] coloc verification window half-size (frames each side; "
+                         "0 = just the 2 candidate frames)")
+    ap.add_argument("--keyframe_disparity", type=float, default=25.0,
+                    help="[ma] LK disparity keyframe gate in px (mirrors ma_slam.run; "
+                         "0 = off, feed every frame)")
+    # instance-LC (semantic-assisted tier-B loop candidates; [ma] geometry only)
+    ap.add_argument("--sem_lc", default="shadow", choices=["off", "shadow", "enforce", "veto"],
+                    help="[ma] instance-bag gating of SALAD tier-B candidates "
+                         "(shadow = log SEMLC verdicts only)")
+    ap.add_argument("--sem_lc_floor", type=float, default=0.45,
+                    help="[ma] tier-B SALAD floor")
+    ap.add_argument("--sem_lc_max", type=int, default=2,
+                    help="[ma] max tier-B candidates per submap")
+    ap.add_argument("--bd_nmin", type=int, default=2,
+                    help="[ma] bidesc: instances per side below this -> UNKNOWN")
+    ap.add_argument("--bd_pair", type=float, default=0.85,
+                    help="[ma] bidesc: MNN unique-match cosine (tau_pair)")
+    ap.add_argument("--bd_dir", type=float, default=0.85,
+                    help="[ma] bidesc: per-direction MeanTopK threshold (tau_dir)")
+    ap.add_argument("--bd_bi", type=float, default=0.85,
+                    help="[ma] bidesc: harmonic-mean threshold (tau_bi)")
+    ap.add_argument("--bd_nuniq", type=int, default=2,
+                    help="[ma] bidesc: min unique MNN matches for PASS")
+    ap.add_argument("--bd_kbag", type=int, default=16,
+                    help="[ma] bidesc: per-frame instance-id cap (by objectness)")
+    ap.add_argument("--sem_lc_coloc", type=float, default=0.50,
+                    help="[ma] stricter coloc gate for tier-B edges (weak SALAD "
+                         "prior needs stronger geometry); <=0 uses coloc_ratio")
     ap.add_argument("--depth_max", type=float, default=0.0, help="[ma] clamp far depth (m)")
     ap.add_argument("--gt", default=None, help="[ma] GT trajectory for ATE report")
     ap.add_argument("--conf_gate_coef", type=float, default=1.0,

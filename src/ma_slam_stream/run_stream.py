@@ -63,7 +63,8 @@ def _finalize(slam, out, n, elapsed, fps, vram, mode, compute_fps=None, compute_
     print(f"[ma_slam] done. {n} frames | submaps={slam.map.num_submaps()} "
           f"loops={slam.graph.get_num_loops()} | poses -> {poses_txt}  pcd -> {combined_ply}")
 
-    n_accept = sum(1 for ln in slam.loop_log if "ACCEPT" in ln)
+    n_accept = sum(1 for ln in slam.loop_log
+                   if ln.startswith("LOOPCAND ACCEPT") and "-DRY" not in ln)
     stats = {
         "backend": type(slam.model).__name__, "mode": mode,
         "submap_size": slam.cfg["submap_size"], "overlap": slam.cfg["overlap"],
@@ -171,6 +172,9 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
     vram = torch.cuda.max_memory_allocated() / 1e9 if cuda else 0.0
     # Offline run() fires on_finish itself; the stream loop drives process_submap
     # directly, so fire it here (final re-lift + merge + reference-format export).
+    if getattr(slam, "_unopt_loop_edges", 0) > 0:  # tier-B edge after last optimize
+        slam.graph.optimize()
+        slam._unopt_loop_edges = 0
     if hooks is not None:
         hooks.on_finish(slam.map, slam.graph)
     return _finalize(slam, out, n_frames, wall, wall_fps, vram, mode,
@@ -198,6 +202,7 @@ def main():
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
     ap.add_argument("--loop_half_window", type=int, default=DEFAULT_CONFIG["Loop"]["half_window"])
+    ap.add_argument("--rot_max_deg", type=float, default=DEFAULT_CONFIG["Loop"]["rot_max_deg"])
     ap.add_argument("--voxel_size", type=float, default=DEFAULT_CONFIG["Pointcloud"]["voxel_size"])
     ap.add_argument("--max_points", type=int, default=DEFAULT_CONFIG["Pointcloud"]["max_points"])
     ap.add_argument("--conf_coef", type=float, default=DEFAULT_CONFIG["Pointcloud"]["conf_coef"])
@@ -238,6 +243,30 @@ def main():
     sp.add_argument("--h2o_subsample", type=float, default=0.25,
                     help="[h2o] query subsample for colsum scores (0.25 validated: "
                          "AP par with full scores, colsum cost ~gone)")
+    # ── instance-LC (semantic-assisted loop candidates; needs --semantic) ──
+    sp.add_argument("--sem_lc", default="shadow", choices=["off", "shadow", "enforce", "veto"],
+                    help="instance-bag gating of SALAD tier-B candidates: shadow = "
+                         "log SEMLC verdicts only (default), enforce = gated tier-B "
+                         "loops become real edges")
+    sp.add_argument("--sem_lc_floor", type=float, default=0.45,
+                    help="tier-B SALAD floor: candidates in [floor, sim_threshold) "
+                         "go through the instance gate")
+    sp.add_argument("--sem_lc_max", type=int, default=2,
+                    help="max tier-B candidates per submap (coloc budget)")
+    sp.add_argument("--bd_nmin", type=int, default=2,
+                    help="bidesc: instances per side below this -> UNKNOWN")
+    sp.add_argument("--bd_pair", type=float, default=0.85,
+                    help="bidesc: MNN unique-match cosine (tau_pair)")
+    sp.add_argument("--bd_dir", type=float, default=0.85,
+                    help="bidesc: per-direction MeanTopK threshold (tau_dir)")
+    sp.add_argument("--bd_bi", type=float, default=0.85,
+                    help="bidesc: harmonic-mean threshold (tau_bi)")
+    sp.add_argument("--bd_nuniq", type=int, default=2,
+                    help="bidesc: min unique MNN matches for PASS")
+    sp.add_argument("--bd_kbag", type=int, default=16,
+                    help="bidesc: per-frame instance-id cap (by objectness)")
+    sp.add_argument("--sem_lc_coloc", type=float, default=0.50,
+                    help="stricter coloc gate for tier-B edges; <=0 uses coloc_ratio")
 
     add_capture_args(ap)                          # --width/--height/--fps/--k/--enable_ir/... (local only)
     a = ap.parse_args()
@@ -253,7 +282,13 @@ def main():
     cfg["submap_size"] = a.submap_size
     cfg["Graph"]["manifold"] = a.manifold
     cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold,
-                       coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window)
+                       coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window,
+                       rot_max_deg=a.rot_max_deg)
+    cfg["Loop"]["Instance"].update(
+        enable=(a.semantic and a.sem_lc != "off"), shadow=(a.sem_lc not in ("enforce", "veto")),
+        veto=(a.sem_lc == "veto"),
+        tier_b_floor=a.sem_lc_floor, max_tier_b=a.sem_lc_max,
+        coloc_ratio_b=(a.sem_lc_coloc if a.sem_lc_coloc > 0 else None))
     cfg["Pointcloud"].update(voxel_size=a.voxel_size, max_points=a.max_points, conf_coef=a.conf_coef)
 
     model = None
@@ -305,9 +340,13 @@ def main():
             h2o_subsample      = a.h2o_subsample,
         )
         name = os.path.basename(os.path.normpath(a.out))
-        hooks = SemanticHooks(sem_cfg, a.out, name=name)
+        from ma_slam_semantic.bidesc_lc import BiDescConfig
+        lc_cfg = BiDescConfig(n_min=a.bd_nmin, tau_pair=a.bd_pair, tau_dir=a.bd_dir,
+                              tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag)
+        hooks = SemanticHooks(sem_cfg, a.out, name=name, lc_cfg=lc_cfg)
         print(f"[ma_slam] semantic hooks armed (kv_policy={a.kv_policy}, "
-              f"chunk={a.sem_chunk_size}) — instance layer in viewer, export at stop")
+              f"chunk={a.sem_chunk_size}, sem_lc={a.sem_lc}) — instance layer in "
+              f"viewer, export at stop")
 
     slam = MaSlam(config=cfg, model=model, device=a.device, hooks=hooks)
     res = stream_loop(slam, source, a.out, mode=a.mode, intrinsics=intrinsics,

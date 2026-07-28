@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--backend", default="ma", choices=["ma", "da3"],
                     help="reconstruction backbone: 'ma' MapAnything (4 modes) | "
                          "'da3' DA3NESTED-GIANT-LARGE-1.1 (metric rgb / rgb+intr, no depth input)")
+    ap.add_argument("--da3_ray_pose", action="store_true",
+                    help="da3 backend: derive poses from the predicted camera-ray maps "
+                         "(use_ray_pose=True) instead of the camera-decoder head")
     ap.add_argument("--manifold", default="se3", choices=["se3", "sim3", "sl4"],
                     help="pose-graph backend + inter-submap transform group: "
                          "se3 (metric, default) | sim3 (+scale, pypose) | sl4 (projective, needs gtsam fork)")
@@ -44,6 +47,8 @@ def main():
     ap.add_argument("--no_loop", action="store_true")
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
+    ap.add_argument("--rot_max_deg", type=float, default=DEFAULT_CONFIG["Loop"]["rot_max_deg"],
+                    help="reject loop candidates whose graph-estimated relative rotation exceeds this (0 = off)")
     ap.add_argument("--loop_half_window", type=int, default=DEFAULT_CONFIG["Loop"]["half_window"],
                     help="verification window radius: 0 = the 2 candidate frames only; "
                          ">0 also re-infers each frame's in-submap neighbours")
@@ -115,7 +120,7 @@ def main():
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["submap_size"] = a.submap_size
     cfg["Graph"]["manifold"] = a.manifold
-    cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold,
+    cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold, rot_max_deg=a.rot_max_deg,
                        coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window,
                        debug_coloc=a.debug_coloc)
     cfg["Pointcloud"].update(voxel_size=a.voxel_size, max_points=a.max_points, conf_coef=a.conf_coef)
@@ -125,7 +130,7 @@ def main():
         from model.da3_infer import Da3ChunkModel
         if "depth" in a.mode:
             ap.error("backend da3 supports rgb / rgb+intr only (DA3 does not ingest depth)")
-        model = Da3ChunkModel(device=a.device)
+        model = Da3ChunkModel(device=a.device, use_ray_pose=a.da3_ray_pose)
 
     res = MaSlam(config=cfg, model=model, device=a.device).run(
         image_paths, a.out, mode=a.mode, depth_paths=depth_paths,

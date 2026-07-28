@@ -63,6 +63,10 @@ class GraphMap:
                                               max_points=budget, rng=rng)
             if len(p):
                 pts.append(p); cols.append(c)
+        if not pts:      # every point filtered out (e.g. a very high conf_coef)
+            print(f"[ma_slam] point cloud: 0 points (conf_coef={conf_coef} kept nothing) "
+                  f"-> {path} not written")
+            return None
         pts = np.concatenate(pts, 0)
         cols = np.concatenate(cols, 0).astype(np.float64) / 255.0
         pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))

@@ -50,6 +50,33 @@ DEFAULT_CONFIG: Dict = {
               "loop_robust": "huber", "loop_robust_k": 1.345},
     "Loop": {"enable": True, "sim_threshold": 0.50, "min_submap_gap": 2,
              "coloc_ratio": 0.70, "max_per_submap": 1, "half_window": 0,
+             # Rotation gate (free, pre-verification): reject candidates whose
+             # graph-estimated relative rotation exceeds this. Rotation barely drifts
+             # (measured vs GT on TUM fr1: median 0-1 deg, max 15 over 500-frame gaps),
+             # while GT-real loops all sit at 2-20 deg and the large-angle candidates
+             # are "same place/object seen from the opposite side" — valid recognition,
+             # useless (and harmful) as a pose constraint. 0 = off.
+             # Measured on TUM fr1: helps base only via one scene (floor), but on top of
+             # the semantic gate it is net-harmful (360 +19%, plant +28% — it rejects good
+             # candidates too). Kept as an ablation knob; OFF by default.
+             "rot_max_deg": 0.0,
+             # Bi-Desc LC (needs hooks with verify_loop_candidate, i.e. --semantic):
+             # SALAD candidates in [tier_b_floor, sim_threshold) get a bidirectional
+             # instance-descriptor verdict (ma_slam_semantic/bidesc_lc.py). shadow=True
+             # logs BIDESC verdicts for tier A+B and dry-colocs every tier-B candidate
+             # (ground truth for both FN and FP sides) without changing behavior.
+             # enforce: tier-B only PASS proceeds to the strict tier-B coloc gate
+             # coloc_ratio_b (FAIL and UNKNOWN both early-reject; weak SALAD prior
+             # -> demand stronger geometry; None = use coloc_ratio). Tier A never gated.
+             # veto mode ("veto": True): NO tier-B; ALL candidates use the baseline
+             # SALAD 0.5, but tier-A edges are deferred one submap and a FAIL verdict
+             # raises the coloc bar to coloc_ratio_veto (FAIL must geometrically
+             # prove itself harder; PASS/UNKNOWN keep coloc_ratio). Spares
+             # excellent-coloc real loops (360 194<->95 @0.044) while killing
+             # borderline coloc mis-accepts (office 125<->25 @0.554, floor 0.700).
+             "Instance": {"enable": True, "shadow": True, "veto": False,
+                          "tier_b_floor": 0.45, "max_tier_b": 2,
+                          "coloc_ratio_b": 0.50, "coloc_ratio_veto": 0.45},
              # debug: dump each loop candidate's two re-inferred windows as a green(query)/
              # red(match) PLY in <out>/coloc/ so co-location accept/reject can be eyeballed.
              "debug_coloc": False,
@@ -86,8 +113,15 @@ class MaSlam:
         # set in run()
         self._mode = "rgb"; self._input_K = None; self._depth_scale = 1000.0; self._depth_max = None
         self._coloc_dir: Optional[str] = None    # set in run() when Loop.debug_coloc is on
-        self.stats = dict(n_loops=0, n_submaps=0)
+        self.stats = dict(n_loops=0, n_submaps=0, n_sem_loops=0)
         self.loop_log: List[str] = []   # every loop candidate decision (saved to loops.txt)
+        # instance-LC per-submap state: tier-A candidates awaiting a shadow SEMLC
+        # verdict, tier-B candidates awaiting the instance gate (both verified after
+        # hooks.on_submap, when the current submap's bags exist), and the count of
+        # loop edges added after this submap's optimize (consumed next optimize).
+        self._tier_a_shadow: List = []
+        self._pending_sem: List = []
+        self._unopt_loop_edges = 0
 
     @property
     def model(self):
@@ -209,6 +243,40 @@ class MaSlam:
             self.graph.add_between(sm.key(i - 1), sm.key(i), rel, kind="inner")
 
     # ------------------------------------------------------------------ loop closure
+    def _instance_lc_active(self) -> bool:
+        inst = self.cfg["Loop"].get("Instance") or {}
+        return bool(inst.get("enable")) and self.hooks is not None \
+            and hasattr(self.hooks, "verify_loop_candidate")
+
+    def _rot_gate(self, sm: Submap, cand) -> bool:
+        """Free pre-verification filter on the graph-estimated relative rotation.
+
+        Rotation is the one quantity that barely drifts, so the current estimate is
+        trustworthy even across long loops. A large relative rotation means the two
+        frames look at the place from very different sides: recognition may well be
+        correct (same room, same object) but the pair carries almost no co-visibility,
+        so the re-inferred relative pose is noise. Rejecting these costs nothing and
+        never touched a GT-verified real loop in the TUM fr1 audit.
+        """
+        lim = self.cfg["Loop"].get("rot_max_deg", 0.0)
+        if not lim:
+            return True
+        match_sm = self.map.get(cand.match_base)
+        Rq = self.graph.get_pose(sm.key(cand.query_frame))[:3, :3]
+        Rm = self.graph.get_pose(match_sm.key(cand.match_frame))[:3, :3]
+        c = (np.trace(Rq.T @ Rm) - 1.0) / 2.0
+        rot = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+        if rot <= lim:
+            return True
+        line = (f"ROTGATE REJECT rot={rot:.0f}deg lim={lim:.0f} sim={cand.similarity:.2f} "
+                f"q={cand.query_base}+{cand.query_frame} "
+                f"m={cand.match_base}+{cand.match_frame} "
+                f"qimg={sm.image_paths[cand.query_frame]} "
+                f"mimg={match_sm.image_paths[cand.match_frame]}")
+        self.loop_log.append(line)
+        print(f"[ma_slam] {line}")
+        return False
+
     def _loop_closure(self, sm: Submap):
         lc = self.cfg["Loop"]
         descs = self.retrieval.describe(sm.image_paths)
@@ -218,17 +286,44 @@ class MaSlam:
         ordered = sorted(self.map.submaps)
         for b in ordered[-lc["min_submap_gap"]:]:
             recent.add(b)
-        cands = self.retrieval.query(descs, sm.base_id, lc["sim_threshold"], recent)
-        cands = sorted(cands, key=lambda c: -c.similarity)[:lc["max_per_submap"]]
+        # with instance-LC active, retrieve down to the tier-B floor; candidates in
+        # [floor, sim_threshold) are stashed for the instance gate after on_submap.
+        use_inst = self._instance_lc_active()
+        inst = lc.get("Instance") or {}
+        floor = min(lc["sim_threshold"], inst["tier_b_floor"]) if use_inst \
+            else lc["sim_threshold"]
+        veto = use_inst and inst.get("veto") and not inst.get("shadow")
+        if veto:
+            floor = lc["sim_threshold"]        # veto mode: no tier-B mining
+        cands = self.retrieval.query(descs, sm.base_id, floor, recent)
+        cands = [c for c in cands if self._rot_gate(sm, c)]
+        tier_a = sorted([c for c in cands if c.similarity >= lc["sim_threshold"]],
+                        key=lambda c: -c.similarity)[:lc["max_per_submap"]]
         accepted = 0
-        for c in cands:
-            if self._add_loop_constraint(sm, c):
-                accepted += 1
+        if veto:
+            # defer tier-A verification until the verdict exists (post-on_submap);
+            # the edge lands before the NEXT submap's optimize (one-submap delay).
+            self._tier_a_shadow = []
+            self._pending_sem = [("A", c) for c in tier_a]
+        else:
+            for c in tier_a:
+                if self._add_loop_constraint(sm, c):
+                    accepted += 1
+            if use_inst:
+                self._tier_a_shadow = tier_a
+                self._pending_sem = [("B", c) for c in sorted(
+                    [c for c in cands if c.similarity < lc["sim_threshold"]],
+                    key=lambda c: -c.similarity)[:inst["max_tier_b"]]]
         self.retrieval.add(descs, sm.base_id)
         return accepted
 
-    def _add_loop_constraint(self, sm: Submap, cand) -> bool:
+    def _add_loop_constraint(self, sm: Submap, cand, commit: bool = True,
+                             coloc_max: Optional[float] = None) -> bool:
         """Re-infer a window around each candidate frame jointly, verify co-location, add edge.
+        ``commit=False`` runs the full re-infer + coloc verdict (logged) but adds no
+        edge — used by instance-LC ``shadow_coloc`` to collect ground truth.
+        ``coloc_max`` overrides ``Loop.coloc_ratio`` (tier-B edges use the stricter
+        ``Instance.coloc_ratio_b``: weak retrieval prior -> stronger geometric gate).
 
         ``half_window`` (hw) controls the verification window: hw=0 re-infers just the two
         candidate frames; hw>0 also pulls each frame's in-submap neighbours so MapAnything
@@ -254,10 +349,11 @@ class MaSlam:
         d = out["depth"]; valid = d > 0
         ref = float(np.median(d[valid])) + 1e-6 if valid.any() else 1.0
         coloc = float(np.linalg.norm(ctr[:la].mean(0) - ctr[la:].mean(0)) / ref)
-        passed = coloc <= self.cfg["Loop"]["coloc_ratio"]
+        passed = coloc <= (coloc_max if coloc_max is not None
+                           else self.cfg["Loop"]["coloc_ratio"])
         # Parseable per-candidate record (image paths included for manual inspection).
         qimg, mimg = sm.image_paths[cand.query_frame], match_sm.image_paths[cand.match_frame]
-        line = (f"LOOPCAND {'ACCEPT' if passed else 'REJECT'} "
+        line = (f"LOOPCAND {'ACCEPT' if passed else 'REJECT'}{'' if commit else '-DRY'} "
                 f"coloc={coloc:.3f} sim={cand.similarity:.2f} hw={hw} "
                 f"q={cand.query_base}+{cand.query_frame} m={cand.match_base}+{cand.match_frame} "
                 f"qimg={qimg} mimg={mimg}")
@@ -265,8 +361,8 @@ class MaSlam:
         print(f"[ma_slam] {line}")
         if self._coloc_dir is not None:
             self._save_coloc_ply(out, la, len(self.loop_log), passed, coloc, cand)
-        if not passed:
-            return False
+        if not passed or not commit:
+            return passed
         # measurement between the actual query and match frames in the joint reconstruction.
         qi = qa.index(cand.query_frame)
         mi = la + mb.index(cand.match_frame)
@@ -277,6 +373,57 @@ class MaSlam:
         if self.hooks is not None:
             self.hooks.on_loop(sm.key(cand.query_frame), match_sm.key(cand.match_frame))
         return True
+
+    def _instance_lc_pass(self, sm: Submap):
+        """Post-``on_submap`` instance verification (bags for ``sm`` now exist).
+
+        Tier A: shadow verdict only (SEMLC log line; behavior untouched — coloc
+        already ran synchronously in ``_loop_closure``). Tier B: verdict gates the
+        candidate; in shadow mode nothing is acted on (optionally a dry-run coloc
+        for calibration), in enforce mode a PASS goes through the normal coloc +
+        loop edge, which the NEXT submap's optimize consumes (one-submap delay).
+        """
+        inst = self.cfg["Loop"]["Instance"]
+        cb = inst.get("coloc_ratio_b")
+        veto = inst.get("veto") and not inst.get("shadow")
+        tiers = [("A", c) for c in self._tier_a_shadow] + list(self._pending_sem)
+        self._tier_a_shadow, self._pending_sem = [], []
+        for tier, cand in tiers:
+            match_sm = self.map.get(cand.match_base)
+            qimg = sm.image_paths[cand.query_frame]
+            mimg = match_sm.image_paths[cand.match_frame]
+            v = self.hooks.verify_loop_candidate(qimg, mimg)
+            line = (f"BIDESC {tier} {v.summary()} sim={cand.similarity:.2f} "
+                    f"q={cand.query_base}+{cand.query_frame} "
+                    f"m={cand.match_base}+{cand.match_frame} qimg={qimg} mimg={mimg}")
+            self.loop_log.append(line)
+            print(f"[ma_slam] {line}")
+            if getattr(v, "pairs", None):
+                self.loop_log.append(
+                    f"BIDESCPAIRS q={cand.query_base}+{cand.query_frame} "
+                    f"m={cand.match_base}+{cand.match_frame} {v.pairs_str()}")
+            if tier == "A":
+                if not veto:
+                    continue                     # shadow bookkeeping only
+                # veto mode: FAIL raises the coloc bar to coloc_ratio_veto —
+                # a FAIL candidate must geometrically prove itself harder.
+                cv = inst.get("coloc_ratio_veto") if v.status == "FAIL" else None
+                if self._add_loop_constraint(sm, cand, coloc_max=cv):
+                    self._unopt_loop_edges += 1
+                continue
+            if inst["shadow"]:
+                # shadow: dry-coloc EVERY tier-B candidate (any verdict) — collects
+                # ground truth for BOTH the FAIL side (FN rate, v1's blind spot)
+                # and the PASS side.
+                self._add_loop_constraint(sm, cand, commit=False, coloc_max=cb)
+            elif v.status == "PASS":
+                # enforce: only PASS proceeds to the strict tier-B coloc gate.
+                # FAIL early-rejects; UNKNOWN too — "no instance evidence" candidates
+                # fed to a position-blind coloc were exactly the toxic edges on
+                # rotation-only scenes (tum360: 3 UNKNOWN edges -> ATE +76%).
+                if self._add_loop_constraint(sm, cand, coloc_max=cb):
+                    self.stats["n_sem_loops"] += 1
+                    self._unopt_loop_edges += 1
 
     # ------------------------------------------------------------------ coloc debug
     @staticmethod
@@ -336,13 +483,23 @@ class MaSlam:
         self._next_base += sm.n
         self.stats["n_submaps"] += 1
 
-        if self.retrieval is not None and prev is not None:
-            self._loop_closure(sm)
+        if self.retrieval is not None:
+            if prev is not None:
+                self._loop_closure(sm)
+            else:
+                # First submap: nothing to query yet, but its descriptors MUST enter
+                # the DB or back-to-start loops are unretrievable forever (bug found
+                # on office_loop: true end<->start pairs at SALAD 0.78 were invisible
+                # because submap 0 was never added).
+                self.retrieval.add(self.retrieval.describe(sm.image_paths), sm.base_id)
 
         self.graph.optimize()
+        self._unopt_loop_edges = 0
 
         if self.hooks is not None:
             self.hooks.on_submap(sm, self.map, self.graph)   # post-optimize poses
+            if self.retrieval is not None and self._instance_lc_active():
+                self._instance_lc_pass(sm)
 
     def run(self, image_paths: Sequence[str], output_dir: str, *, mode: str = "rgb",
             depth_paths: Optional[Sequence[str]] = None,
@@ -383,6 +540,10 @@ class MaSlam:
               f"(streaming, model-load excluded) | peak VRAM {vram:.1f} GB | "
               f"submap_size={self.cfg['submap_size']}")
 
+        if self._unopt_loop_edges > 0:      # tier-B edge added after the last optimize
+            self.graph.optimize()
+            self._unopt_loop_edges = 0
+
         if self.hooks is not None:
             self.hooks.on_finish(self.map, self.graph)       # final graph, pre-export
 
@@ -396,7 +557,8 @@ class MaSlam:
               f"loops={self.graph.get_num_loops()} | poses -> {poses_txt}  pcd -> {combined_ply}")
 
         # always persist run stats + loop events to the output dir (esp. for no-GT in-the-wild runs)
-        n_accept = sum(1 for ln in self.loop_log if "ACCEPT" in ln)
+        n_accept = sum(1 for ln in self.loop_log
+                       if ln.startswith("LOOPCAND ACCEPT") and "-DRY" not in ln)
         stats = {
             "backend": type(self.model).__name__, "mode": mode,
             "submap_size": self.cfg["submap_size"], "overlap": self.cfg["overlap"],
