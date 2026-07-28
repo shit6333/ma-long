@@ -45,13 +45,16 @@ class Da3ChunkModel:
     SUPPORTED_MODES = ("rgb", "rgb+intr")
 
     def __init__(self, model_id: str = _DEFAULT_MODEL_ID, device: str = "cuda",
-                 *, process_res: int = 504):
+                 *, process_res: int = 504, use_ray_pose: bool = False):
         _ensure_da3_importable()
         from depth_anything_3.api import DepthAnything3
 
         self.device = device
         self.model_id = model_id
         self.process_res = process_res
+        # False → DA3 camera-decoder head; True → pose decomposed from the predicted ray maps
+        # (both land in pred.extrinsics as w2c, so downstream handling is identical).
+        self.use_ray_pose = use_ray_pose
         self.model = DepthAnything3.from_pretrained(model_id).to(device).eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
@@ -89,7 +92,8 @@ class Da3ChunkModel:
             K_in = np.broadcast_to(K, (n, 3, 3)).copy() if K.shape == (3, 3) else K
 
         pred = self.model.inference(list(image_paths), intrinsics=K_in,
-                                    process_res=self.process_res)
+                                    process_res=self.process_res,
+                                    use_ray_pose=self.use_ray_pose)
         depth = np.ascontiguousarray(pred.depth, dtype=np.float32)          # (N,H,W) metric Z
         conf = np.ascontiguousarray(pred.conf, dtype=np.float32)            # (N,H,W)
         Kp = np.ascontiguousarray(pred.intrinsics, dtype=np.float64)        # (N,3,3) at proc res
