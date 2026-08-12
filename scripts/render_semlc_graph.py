@@ -149,6 +149,12 @@ def draw_side(ax, img, rec_nodes, K, matched, sub_mnn, edges, side):
     ax.set_ylim(H, 0)
     ax.set_xticks([])
     ax.set_yticks([])
+    if K is None:                       # frame never entered the instance index
+        ax.text(W / 2, H / 2, "no instance record\n(S1 UNKNOWN source)",
+                color="#ffdd55", fontsize=13, ha="center", va="center",
+                bbox=dict(fc="black", alpha=0.6, pad=6))
+        ax.set_title(side, fontsize=10)
+        return
 
     xyz = np.array([n["xyz"] if n["xyz"] else [0, 0, -1] for n in rec_nodes], float)
     uv = project(K, xyz) if len(xyz) else np.zeros((0, 2))
@@ -214,8 +220,6 @@ def render_one(rec, out_png, res, salad=None):
     s1, s2 = rec["s1"], rec["s2"]
     K_q = np.array(rec["K_q"]) if rec["K_q"] else None
     K_r = np.array(rec["K_r"]) if rec["K_r"] else None
-    if K_q is None or K_r is None:
-        return False
 
     uniq = [p for p in rec["pairs"] if p["uniq"]]
     subp = [p for p in rec["pairs"] if not p["uniq"]]

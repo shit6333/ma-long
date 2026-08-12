@@ -113,10 +113,16 @@ class SemanticHooks:
         ids_q = self.frame_index.get(q_path)
         ids_r = self.frame_index.get(m_path)
         if not ids_q or not ids_r or self.table is None:
-            return BiDescVerdict("UNKNOWN",
-                                 n_q=0 if not ids_q else len(ids_q),
-                                 n_r=0 if not ids_r else len(ids_r),
-                                 reason="no frame index")
+            v = BiDescVerdict("UNKNOWN",
+                              n_q=0 if not ids_q else len(ids_q),
+                              n_r=0 if not ids_r else len(ids_r),
+                              reason="no frame index")
+            if self.lc_cfg.dump_dir:
+                # dump these too — the UNKNOWN-accept path is exactly the case a
+                # reviewer wants to eyeball (frame with no recorded instances).
+                self._dump_candidate(q_path, m_path, v, ids_q or [], ids_r or [],
+                                     [], [])
+            return v
         # history side is always the map's running mean (it IS the memory); the
         # current side is either the same lookup ('map') or the frame's raw
         # proposal descriptors ('proposal' — independent of the association layer).

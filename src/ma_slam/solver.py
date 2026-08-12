@@ -76,7 +76,15 @@ DEFAULT_CONFIG: Dict = {
              # borderline coloc mis-accepts (office 125<->25 @0.554, floor 0.700).
              "Instance": {"enable": True, "shadow": True, "veto": False,
                           "tier_b_floor": 0.45, "max_tier_b": 2,
-                          "coloc_ratio_b": 0.50, "coloc_ratio_veto": 0.45},
+                          "coloc_ratio_b": 0.50, "coloc_ratio_veto": 0.45,
+                          # S1 UNKNOWN (no instance evidence) hard-rejects instead of
+                          # falling back to the normal coloc bar. Default ON: uniform
+                          # with M_LOW ("a loop edge needs positive instance evidence";
+                          # UNKNOWN is M=0). Validated 2026-08-12: the killed edges are
+                          # cluster-redundant (360 +0.001, teddy ~0, s0231 -0.001),
+                          # and it closes the coloc-solo path (teddy 1043<->0 gray
+                          # accept; v1-era 447<->141 / 269<->145 wrong accepts).
+                          "unknown_fail": True},
              # debug: dump each loop candidate's two re-inferred windows as a green(query)/
              # red(match) PLY in <out>/coloc/ so co-location accept/reject can be eyeballed.
              "debug_coloc": False,
@@ -415,6 +423,14 @@ class MaSlam:
                 # Stage 2 consumption: LVC / T_FAR are the cases where coloc has
                 # NO discriminating power (rotation-blind position check accepted
                 # all 8 GT-false edges of these types) -> hard reject, no coloc.
+                if inst.get("unknown_fail") and v.status == "UNKNOWN":
+                    line = (f"UNKFAIL REJECT "
+                            f"q={cand.query_base}+{cand.query_frame} "
+                            f"m={cand.match_base}+{cand.match_frame} "
+                            f"qimg={qimg} mimg={mimg}")
+                    self.loop_log.append(line)
+                    print(f"[ma_slam] {line}")
+                    continue
                 s2 = getattr(v, "layout", None)
                 if s2 is not None and s2.status in ("LARGE_VIEW_CHANGE", "T_FAR", "M_LOW"):
                     line = (f"S2GATE REJECT {s2.status} "

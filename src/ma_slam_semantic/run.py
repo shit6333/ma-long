@@ -121,7 +121,8 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
         enable=(a.sem_lc != "off"), shadow=(a.sem_lc not in ("enforce", "veto")),
         veto=(a.sem_lc == "veto"),
         tier_b_floor=a.sem_lc_floor, max_tier_b=a.sem_lc_max,
-        coloc_ratio_b=(a.sem_lc_coloc if a.sem_lc_coloc > 0 else None))
+        coloc_ratio_b=(a.sem_lc_coloc if a.sem_lc_coloc > 0 else None),
+        unknown_fail=(a.sem_lc_unknown == "fail"))
 
     backend = None
     if a.backend == "da3":
@@ -204,6 +205,10 @@ def main():
                     help="[ma] bidesc: min unique MNN matches for PASS")
     ap.add_argument("--bd_kbag", type=int, default=16,
                     help="[ma] bidesc: per-frame instance-id cap (by objectness)")
+    ap.add_argument("--sem_lc_unknown", default="fail", choices=["coloc", "fail"],
+                    help="S1 UNKNOWN handling: 'fail' = hard-reject (default; uniform "
+                         "with M_LOW — no instance evidence, no edge), 'coloc' = fall "
+                         "through to the normal coloc bar")
     ap.add_argument("--sem_lc_dump", action="store_true",
                     help="dump per-candidate scene-graph JSONs to <out>/semlc_dump "
                          "(render with scripts/render_semlc_graph.py)")
