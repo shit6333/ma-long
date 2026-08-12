@@ -92,6 +92,11 @@ class BiDescConfig:
                                  # evidence member is cheap (redundancy).
     s2_min_m_rot: int = 4        # below this, rotation/translation metrics abstain
 
+    # Debug: when set, verify_loop_candidate dumps one JSON per candidate here
+    # (both frames' full node lists with camera-frame XYZ, the MNN pairs, per-frame
+    # K, and the S1+S2 verdicts) for scripts/render_semlc_graph.py.
+    dump_dir: str = ""
+
 
 def adaptive_k(n: int, cfg: BiDescConfig) -> int:
     return max(1, min(n, max(cfg.k_lo, min(cfg.k_hi, int(np.ceil(cfg.k_frac * n))))))
@@ -113,10 +118,12 @@ class FrameIndex:
         self._ids: Dict[str, List[Tuple[int, float]]] = {}
         self._descs: Dict[str, np.ndarray] = {}          # path -> (K,256) L2-normed
         self._cents: Dict[str, np.ndarray] = {}          # path -> (K,3) CAMERA-frame 3D
+        self._K: Dict[str, np.ndarray] = {}              # path -> (3,3) K at semantic res
 
     def add(self, path: str, items: Sequence[Tuple[int, float]],
             descs: Optional[Sequence[np.ndarray]] = None,
-            centers: Optional[Sequence[np.ndarray]] = None) -> None:
+            centers: Optional[Sequence[np.ndarray]] = None,
+            K: Optional[np.ndarray] = None) -> None:
         """``items[i]`` = (inst_id, objectness); ``descs[i]`` / ``centers[i]`` = that
         proposal's raw descriptor / CAMERA-frame 3D centre (same order). All are
         truncated to the same top-k_bag subset, so indices stay aligned."""
@@ -131,6 +138,8 @@ class FrameIndex:
             self._cents[path] = (np.stack([np.asarray(centers[i], np.float32)
                                            for i in order])
                                  if order else np.zeros((0, 3), np.float32))
+        if K is not None:
+            self._K[path] = np.asarray(K, np.float32)
 
     def get(self, path: str) -> Optional[List[Tuple[int, float]]]:
         return self._ids.get(path)
@@ -140,6 +149,9 @@ class FrameIndex:
 
     def get_centers(self, path: str) -> Optional[np.ndarray]:
         return self._cents.get(path)
+
+    def get_K(self, path: str) -> Optional[np.ndarray]:
+        return self._K.get(path)
 
     def __len__(self):
         return len(self._ids)

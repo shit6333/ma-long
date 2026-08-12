@@ -50,6 +50,7 @@ class SemanticHooks:
         self.lc_cfg = lc_cfg or BiDescConfig()
         self.frame_index = FrameIndex(k_bag=self.lc_cfg.k_bag,
                                       keep_desc=(self.lc_cfg.desc_src == "proposal"))
+        self._dump_n = 0        # candidate counter for lc_cfg.dump_dir file naming
 
     # ------------------------------------------------------------------ hooks
     def on_submap(self, sm, gmap, graph) -> None:
@@ -88,10 +89,12 @@ class SemanticHooks:
                         ((assign[k], float(p.get("objectness", 0.0))),
                          d.detach().cpu().numpy() if hasattr(d, "detach") else d,
                          c_cam))
+            K_sub = sub["intrinsics"][0].cpu().numpy()   # (T,3,3) at semantic res
             for t, rows in per_frame.items():
                 self.frame_index.add(paths[t], [r[0] for r in rows],
                                      descs=[r[1] for r in rows],
-                                     centers=[r[2] for r in rows])
+                                     centers=[r[2] for r in rows],
+                                     K=K_sub[t])
             n_props += len(props)
         self.n_frames += len(chunk["frame_keys"])
         print(f"[sem_hooks] submap {sm.base_id}: +{len(chunk['frame_keys'])} frames, "
@@ -148,7 +151,53 @@ class SemanticHooks:
             if uniq:
                 qi, ri = zip(*uniq)
                 v.layout = verify_layout(C_q[list(qi)], C_r[list(ri)], self.lc_cfg)
+        if self.lc_cfg.dump_dir:
+            self._dump_candidate(q_path, m_path, v, ids_q, ids_r, q_rows, r_rows)
         return v
+
+    def _dump_candidate(self, q_path, m_path, v, ids_q, ids_r, q_rows, r_rows):
+        """One JSON per verified candidate for scripts/render_semlc_graph.py:
+        full node lists (also unmatched — the M_LOW story needs them), MNN pairs
+        mapped back to FrameIndex rows, per-frame K, and both verdicts."""
+        import json
+        os.makedirs(self.lc_cfg.dump_dir, exist_ok=True)
+
+        def nodes(path, ids):
+            C = self.frame_index.get_centers(path)
+            return [dict(row=k, inst_id=int(iid), obj=float(ob),
+                         xyz=(C[k].tolist() if C is not None and k < len(C) else None))
+                    for k, (iid, ob) in enumerate(ids)]
+
+        def kmat(path):
+            K = self.frame_index.get_K(path)
+            return K.tolist() if K is not None else None
+
+        lay = getattr(v, "layout", None)
+        rec = dict(
+            q_path=q_path, r_path=m_path,
+            s1=dict(status=v.status, a_qr=v.a_qr, a_rq=v.a_rq, a_bi=v.a_bi,
+                    n_uniq=v.n_uniq, n_q=v.n_q, n_r=v.n_r, reason=v.reason),
+            s2=(dict(status=lay.status, m=lay.m, e_d=lay.e_d, theta_r=lay.theta_r,
+                     e_r=lay.e_r, e_scale=lay.e_scale, t_norm=lay.t_norm,
+                     s2=lay.s2, d_ref=lay.d_ref, reason=lay.reason)
+                if lay is not None else None),
+            pairs=[dict(q_row=q_rows[p["q"]], r_row=r_rows[p["r"]],
+                        sim=p["sim"], uniq=p["uniq"]) for p in v.pairs],
+            q_nodes=nodes(q_path, ids_q), r_nodes=nodes(m_path, ids_r),
+            K_q=kmat(q_path), K_r=kmat(m_path),
+            cfg=dict(s2_tau_d=self.lc_cfg.s2_tau_d,
+                     s2_tau_r_deg=self.lc_cfg.s2_tau_r_deg,
+                     s2_tau_theta_deg=self.lc_cfg.s2_tau_theta_deg,
+                     s2_tau_t=self.lc_cfg.s2_tau_t,
+                     s2_min_m=self.lc_cfg.s2_min_m,
+                     s2_min_m_rot=self.lc_cfg.s2_min_m_rot,
+                     resolution=list(self.cfg.resolution)))
+        self._dump_n += 1
+        qn = os.path.splitext(os.path.basename(q_path))[0]
+        rn = os.path.splitext(os.path.basename(m_path))[0]
+        out = os.path.join(self.lc_cfg.dump_dir, f"{self._dump_n:04d}_{qn}__{rn}.json")
+        with open(out, "w") as f:
+            json.dump(rec, f)
 
     def on_loop(self, key_new: int, key_old: int) -> None:
         # Healing is handled by the M-signature mechanism (stale records re-lift

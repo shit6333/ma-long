@@ -133,7 +133,9 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     from ma_slam_semantic.bidesc_lc import BiDescConfig
     lc_cfg = BiDescConfig(n_min=a.bd_nmin, tau_pair=a.bd_pair, tau_dir=a.bd_dir,
                           tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag,
-                          desc_src=a.bd_desc_src)
+                          desc_src=a.bd_desc_src,
+                          dump_dir=(os.path.join(a.out, "semlc_dump")
+                                    if a.sem_lc_dump else ""))
     hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions,
                           lc_cfg=lc_cfg)
     slam = MaSlam(config=slam_cfg, model=backend, hooks=hooks)
@@ -202,6 +204,9 @@ def main():
                     help="[ma] bidesc: min unique MNN matches for PASS")
     ap.add_argument("--bd_kbag", type=int, default=16,
                     help="[ma] bidesc: per-frame instance-id cap (by objectness)")
+    ap.add_argument("--sem_lc_dump", action="store_true",
+                    help="dump per-candidate scene-graph JSONs to <out>/semlc_dump "
+                         "(render with scripts/render_semlc_graph.py)")
     ap.add_argument("--bd_desc_src", default="proposal", choices=["map", "proposal"],
                      help="bidesc current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs (association-independent)")
     ap.add_argument("--sem_lc_coloc", type=float, default=0.50,
