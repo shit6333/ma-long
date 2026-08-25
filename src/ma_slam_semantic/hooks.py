@@ -68,7 +68,8 @@ class SemanticHooks:
         n_props = 0
         for sub in split_chunk(chunk, self.cfg.chunk_size):
             out = self.model.forward_chunk(sub)
-            props, pix_map, _ = make_proposals(out, sub, self.cfg)
+            props, pix_map, _ = make_proposals(out, sub, self.cfg,
+                                               sem_backbone=self.model.semantic_backbone)
             assign = self.table.match_chunk(props, sub["frame_keys"], pix_map)
             paths = [sm.image_paths[i] for i in sub["frame_idx"]]
             # Camera-frame 3D centres for Stage-2 layout graphs: undo the frame's

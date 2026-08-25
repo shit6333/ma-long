@@ -126,6 +126,10 @@ class InstanceRecord:
         self.first_seen = key
         self.last_seen = key
         self.member_objectness: List[float] = [float(prop.get("objectness", 0.0))]
+        # P/Q head per-observation scores (export-side ranking only; empty on
+        # checkpoints without the head -> rankers fall back to objectness)
+        self.member_pq_p: List[float] = [float(prop["pq_p"])] if "pq_p" in prop else []
+        self.member_pq_q: List[float] = [float(prop["pq_q"])] if "pq_q" in prop else []
         self.obs: List[Obs] = [obs]
         # incremental geometry caches (identical math to the reference table)
         self.center: torch.Tensor = prop["center"].detach().cpu().clone()
@@ -163,6 +167,9 @@ class InstanceRecord:
         self.count += 1
         self.last_seen = key
         self.member_objectness.append(float(prop.get("objectness", 0.0)))
+        if "pq_p" in prop and "pq_q" in prop:
+            self.member_pq_p.append(float(prop["pq_p"]))
+            self.member_pq_q.append(float(prop["pq_q"]))
         self.obs.append(obs)
 
     # ---------------------------------------------------------------- derived
@@ -177,6 +184,16 @@ class InstanceRecord:
     @property
     def max_objectness(self) -> float:
         return float(max(self.member_objectness)) if self.member_objectness else 0.0
+
+    @property
+    def has_pq(self) -> bool:
+        return bool(self.member_pq_p) and len(self.member_pq_p) == len(self.member_pq_q)
+
+    def cluster_score(self, ranker: str = "p_top25q") -> float:
+        """Confidence the AP evaluator ranks by (semantic_mapping.stages.ranking;
+        p_top25q = meanP x mean(top-25% Q), objectness fallback without P/Q)."""
+        from semantic_mapping.stages.ranking import score_record
+        return score_record(self, ranker)
 
     @property
     def bbox_volume(self) -> float:
@@ -408,9 +425,12 @@ class InstanceTable:
                 "last_seen": r.last_seen,
                 "num_voxels": r.num_voxels,
                 "mean_objectness": r.mean_objectness,
+                "cluster_score": r.cluster_score(self.cfg.ranker),
                 "member_frames": r.member_frames,
                 "member_slots": r.member_slots,
                 "member_objectness": r.member_objectness,
+                "member_pq_p": r.member_pq_p,
+                "member_pq_q": r.member_pq_q,
             })
         return out
 
@@ -466,6 +486,8 @@ class InstanceTable:
             for o, obj in zip(rec.obs, rec.member_objectness):
                 root.obs.append(o)
                 root.member_objectness.append(obj)
+            root.member_pq_p += rec.member_pq_p
+            root.member_pq_q += rec.member_pq_q
             root.count += rec.count
             n_r, n_i = root.count - rec.count, rec.count
             w_r, w_i = n_r / (n_r + n_i), n_i / (n_r + n_i)

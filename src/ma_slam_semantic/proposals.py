@@ -29,11 +29,70 @@ import torch.nn.functional as F
 from ma_slam_semantic.config import SemConfig
 
 
+# --------------------------------------------------------------------------- sem_query sources
+def _batched_sem_query(sem_t: torch.Tensor, owner: torch.Tensor, n_slots: int) -> torch.Tensor:
+    """Mask-mean of a dense [D,H,W] map per owner slot in one index_add -> [K,D]
+    (L2-normalized; slots owning no pixel get a zero row)."""
+    D = sem_t.shape[0]
+    flat = owner.reshape(-1)
+    sel = flat >= 0
+    idx = flat[sel]
+    feats = sem_t.permute(1, 2, 0).reshape(-1, D)[sel].float()
+    sums = torch.zeros(n_slots, D, device=sem_t.device).index_add_(0, idx, feats)
+    cnt = torch.zeros(n_slots, device=sem_t.device).index_add_(
+        0, idx, torch.ones_like(idx, dtype=torch.float32))
+    out = F.normalize(sums / cnt.clamp(min=1).unsqueeze(1), dim=-1)
+    out[cnt == 0] = 0.0
+    return out
+
+
+@torch.no_grad()
+def _textregion_sem_query(sem_backbone, img_chw: torch.Tensor, owner_masked: torch.Tensor,
+                          n_slots: int) -> torch.Tensor:
+    """A1 route (port of semantic_mapping.stages.proposals._textregion_sem_query):
+    frozen-teacher (TIPS) textregion pool over the PREDICTED masks. The proposal
+    owner map is the instance mask for ``forward_supervision(sem_supervision=
+    'textregion')`` -> per-proposal text-aligned feature (mask-restricted
+    attention-V pool, no per-pixel context bleed), broadcast dense, then
+    mask-mean-collapsed to [K,D]. Costs one extra teacher forward per frame.
+
+    img_chw: [3,H,W] in [-1,1] (loader range) — converted to [0,1] for the teacher.
+    """
+    H, W = owner_masked.shape
+    dev = next(sem_backbone.parameters()).device
+    img01 = ((img_chw.to(dev).float() + 1.0) * 0.5).clamp(0, 1).unsqueeze(0)  # [1,3,H,W]
+    inst = (owner_masked.to(dev) + 1).clamp(min=0).long().view(1, 1, H, W)    # 0=bg, k+1=prop k
+    tr = sem_backbone.forward_supervision(img01, instance_mask=inst,
+                                          sem_supervision="textregion")       # [1,1,D,H,W]
+    semq = _batched_sem_query(tr[0, 0], owner_masked.to(dev), n_slots)        # [K,D]
+    return semq.to(owner_masked.device)
+
+
+def _sem_mode(cfg: SemConfig, sem_dense, sem_backbone) -> str:
+    """Resolve cfg.sem_agg against what THIS forward produced."""
+    mode = cfg.sem_agg
+    if mode == "auto":
+        mode = "dense" if sem_dense is not None else (
+            "textregion" if sem_backbone is not None else "none")
+    if mode == "dense" and sem_dense is None:
+        raise RuntimeError("sem_agg='dense' but the model produced no dense semantic "
+                           "map (A1-type checkpoint?) — use sem_agg auto/textregion")
+    if mode == "textregion" and sem_backbone is None:
+        raise RuntimeError("sem_agg='textregion' needs the frozen semantic backbone "
+                           "(pass sem_backbone=model.semantic_backbone)")
+    return mode
+
+
 # --------------------------------------------------------------------------- GPU path
 @torch.no_grad()
-def make_proposals(out: dict, chunk: dict, cfg: SemConfig
+def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
                    ) -> Tuple[List[Dict], torch.Tensor, torch.Tensor]:
-    """Returns (proposals, pixel_to_proposal [T,H_f,W_f] CPU, pts_headres [T,H_f,W_f,3] CPU)."""
+    """Returns (proposals, pixel_to_proposal [T,H_f,W_f] CPU, pts_headres [T,H_f,W_f,3] CPU).
+
+    ``sem_backbone`` (the model's frozen TIPS teacher) enables the textregion
+    sem_query route for checkpoints without a dense semantic head (cfg.sem_agg).
+    P/Q head outputs (``pq_p``/``pq_q``) are recorded on every proposal when
+    present — export-side ranking only, they never touch matching."""
     from opense3r.instance_post import mask_nms, resolve_per_pixel
 
     if not cfg.panoptic:
@@ -51,6 +110,10 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig
         if out.get(k) is not None:
             sem = out[k][0].detach().float()                        # [T,D,H,W] GPU
             break
+    sem_mode = _sem_mode(cfg, sem, sem_backbone)
+    images = chunk["images"][0] if sem_mode == "textregion" else None  # [T,3,H,W] [-1,1]
+    pq_p = out["pq_p"][0].detach().float() if out.get("pq_p") is not None else None  # [T,N]
+    pq_q = out["pq_q"][0].detach().float() if out.get("pq_q") is not None else None
 
     T, N, H, W = ml.shape
     pts = chunk["world_points_global"].float().to(dev)              # [T,H,W,3]
@@ -97,9 +160,13 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig
         owner, _, act = resolve_per_pixel(ml[t, kept], obj[t, kept], keep[t],
                                           score_threshold=cfg.score_threshold)
 
-        # 4) batched sem_query: masked mean per kept slot via index_add
+        # 4) batched sem_query: masked mean per kept slot via index_add (dense
+        #    head), or frozen-TIPS textregion pool over the owner map (A1 route)
         semq = None
-        if sem is not None:
+        if sem_mode == "textregion":
+            semq = _textregion_sem_query(sem_backbone, images[t],
+                                         owner.masked_fill(~act, -1), K)
+        elif sem_mode == "dense":
             flat_owner = owner.reshape(-1)
             sel = flat_owner >= 0
             idx = flat_owner[sel]
@@ -146,6 +213,10 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig
             }
             if semq is not None:
                 prop["sem_query"] = semq[k_local].cpu()
+            if pq_p is not None and pq_q is not None:
+                # recorded whether or not the ranker uses them (offline re-ranking)
+                prop["pq_p"] = float(pq_p[t, slot].sigmoid().item())
+                prop["pq_q"] = float(pq_q[t, slot].sigmoid().item())
             pixel_to_proposal[t][mask_k] = len(proposals)
             proposals.append(prop)
 
@@ -200,5 +271,7 @@ def make_proposals_cpu(out: dict, chunk: dict, cfg: SemConfig
         sp_score_thr=cfg.sp_score_thr,
         obj_normalize=False,
         sem_conf=None,
+        pq_p=(out["pq_p"][0].detach().cpu().float() if out.get("pq_p") is not None else None),
+        pq_q=(out["pq_q"][0].detach().cpu().float() if out.get("pq_q") is not None else None),
     )
     return proposals, pixel_to_proposal.cpu(), pts

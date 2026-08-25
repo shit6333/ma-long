@@ -61,6 +61,7 @@ class OpenSe3rDA3(nn.Module):
         vggt_ckpt: str = './checkpoints/VGGT.pt',
         omega_ckpt: str = './checkpoints/vggt_omega/vggt_omega_1b_512.pt',
         lbotv_ckpt: str = './checkpoints/lingbot_vision_vitl',
+        dinov3_ckpt: str = './checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth',
         lseg_ckpt: str = './checkpoints/lseg_minimal_e200.ckpt',
         # Semantic head
         sem_dim: int = 64,
@@ -147,6 +148,14 @@ class OpenSe3rDA3(nn.Module):
         query_box_size_extent_aware: bool = False,  # feed log(extent) → extent-aware size mult
         query_use_fgbg_head:   bool = False,  # per-query thing/stuff (fg/bg) logit
         query_fastsam_mask_prior: bool = False,  # ESAM-style: layer-0 attn_mask = FastSAM region
+        # Mid-decoder query merge (DESIGN_INSTANCE_HEAD_OTM_MERGE.md §3;
+        # mask2former only).  Runtime curriculum via set_merge_active().
+        use_pq_head:              bool  = False,   # P/Q scorer (opense3r/pq_head.py)
+        query_merge:              bool  = False,
+        query_merge_layer:        int   = 5,
+        query_merge_tau:          float = 0.9,
+        query_merge_dist_veto:    float = 1.5,
+        query_merge_act_threshold: float = 0.1,
         use_merge_head:      bool = False,
         query_descriptor_mlp_layers: int = 0,
         query_box_head_detach: bool = False,
@@ -169,13 +178,45 @@ class OpenSe3rDA3(nn.Module):
         # `_da3_forward` to call it instead.  Default False keeps the legacy
         # behaviour bit-identical.
         _skip_geo_backbone:  bool = False,
+        # ── Instance-aware semantic head (query head only) ──
+        # Per-instance semantic output = frozen-TIPS textregion base (pooled
+        # over the query's predicted soft mask) + SemProj(query) residual.
+        # When on, the DENSE semantic head/loss are auto-disabled (see
+        # `no_dense_sem`).  inst_sem_dim MUST equal semantic_backbone.output_dim.
+        inst_sem_head:       bool = False,
+        inst_sem_dim:        int  = 1024,
+        # Skip building/running the dense semantic DPT head + its GT (save
+        # VRAM/time).  Auto-forced True when inst_sem_head is on.
+        no_dense_sem:        bool = False,
+        # ── TextRegion seeding (--seed_sem textregion) ──
+        # FastSAM regions seed the queries; their semantic half is pooled with
+        # the frozen teacher's TextRegion (mask-aware V pool) instead of a mean
+        # over the dense head's per-patch output.  Same representation the
+        # instance semantics are read out with, and it removes the last consumer
+        # of the dense semantic head (pair with no_dense_sem to drop it).
+        seed_sem:            str  = 'dense',       # 'dense' | 'textregion'
+        # P/Q's 4th input (the per-query semantic).  'dense' pools the dense
+        # head's output under the query's soft mask -- which needs that head to
+        # exist.  'textregion' pools the frozen teacher's V under the same mask:
+        # same quantity, mask-aware, and it is the representation P/Q ends up
+        # ranking, so the dense head can be dropped.  Default 'dense' keeps every
+        # existing P/Q checkpoint bit-identical.
+        pq_sem_source:       str  = 'dense',       # 'dense' | 'textregion'
+        # ── Dense semantic RESIDUAL (--sem_residual) ──
+        # The dense semantic head predicts a RESIDUAL r; the model's semantic
+        # output = r + frozen native-TIPS dense (detached).  The existing dense
+        # per-pixel loss (textregion GT) then supervises r+native at every pixel
+        # (anchors r → stable, no maskmean division).  FastSAM seeding + the dense
+        # sem map both consume this sum.  Orthogonal to inst_sem_head (mutually
+        # exclusive in practice; inst_sem_head must stay off).
+        sem_residual:        bool = False,
     ):
         super().__init__()
         self._skip_geo_backbone = bool(_skip_geo_backbone)
-        if dino_backbone not in ('vggt', 'omega', 'radio', 'lbotv'):
-            raise ValueError(f"dino_backbone must be 'vggt', 'omega', 'radio' or 'lbotv', got {dino_backbone!r}")
+        if dino_backbone not in ('vggt', 'omega', 'radio', 'lbotv', 'dinov3'):
+            raise ValueError(f"dino_backbone must be 'vggt', 'omega', 'radio', 'lbotv' or 'dinov3', got {dino_backbone!r}")
         self.dino_backbone = dino_backbone
-        if dino_backbone in ('omega', 'radio', 'lbotv') and patch_size != 16:
+        if dino_backbone in ('omega', 'radio', 'lbotv', 'dinov3') and patch_size != 16:
             print(f"[OpenSe3rDA3] dino_backbone='{dino_backbone}' — overriding patch_size {patch_size} → 16")
             patch_size = 16   # RADIO / LingBot-Vision are natively patch-16; use their native grid
         self.patch_size = patch_size
@@ -220,11 +261,52 @@ class OpenSe3rDA3(nn.Module):
             )
         self.instance_head_type = instance_head_type
 
+        # Instance-aware semantic head (query head only).  When on, the dense
+        # semantic head + its GT are skipped (its signal is replaced by the
+        # per-instance residual head).
+        self.inst_sem_head = bool(inst_sem_head)
+        self.inst_sem_dim  = int(inst_sem_dim)
+        self._skip_dense_sem = bool(no_dense_sem) or self.inst_sem_head
+        if self.inst_sem_head and instance_head_type != 'query':
+            raise ValueError("inst_sem_head requires instance_head_type='query'.")
+        if seed_sem not in ('dense', 'textregion'):
+            raise ValueError(f"seed_sem must be 'dense' or 'textregion', got {seed_sem!r}")
+        self.seed_sem = seed_sem
+        if seed_sem == 'textregion' and not fastsam_query:
+            raise ValueError('seed_sem=textregion only applies to --fastsam_query seeding')
+        if pq_sem_source not in ('dense', 'textregion'):
+            raise ValueError(f"pq_sem_source must be 'dense' or 'textregion', got {pq_sem_source!r}")
+        self.pq_sem_source = pq_sem_source
+        if (pq_sem_source == 'textregion' and use_pq_head
+                and seed_sem != 'textregion'):
+            raise ValueError("pq_sem_source='textregion' needs the cached teacher V, "
+                             "which is only produced by seed_sem='textregion'.")
+        # Dense semantic residual: head predicts r, model semantic = r + native.
+        self.sem_residual = bool(sem_residual)
+        if self.sem_residual and self.inst_sem_head:
+            raise ValueError("sem_residual and inst_sem_head are mutually exclusive "
+                             "(sem_residual keeps the DENSE loss; inst_sem_head "
+                             "replaces it with a per-instance loss).")
+        if self.sem_residual and self._skip_dense_sem:
+            raise ValueError("sem_residual needs the dense semantic head running "
+                             "(do not combine with no_dense_sem).")
+
         if semantic_backbone == 'lseg':
-            if prior_method != 'lseg':
-                raise ValueError("semantic_backbone='lseg' requires prior_method='lseg'.")
-            if sem_supervision != 'lseg':
-                raise ValueError("semantic_backbone='lseg' requires sem_supervision='lseg'.")
+            # LEGACY: prior_method='lseg' + sem_supervision='lseg' (dense-feat-as-GT).
+            # NEW:    prior_method='native' + sem_supervision='patch_mean' — LSeg now
+            #   subclasses VLMBackboneBase, so the SAME machinery as TIPS/RADIO runs
+            #   (forward_prior_native + patch_mean_aggregate = mask-aggregate-to-GT).
+            #   textregion/mask_crops/proxy_clip need CLIP attention-V (no LSeg _v_forward).
+            if prior_method not in ('lseg', 'native'):
+                raise ValueError("semantic_backbone='lseg' requires prior_method in "
+                                 "{'lseg' (legacy), 'native' (patch_mean)}.")
+            if sem_supervision not in ('lseg', 'patch_mean'):
+                raise ValueError("semantic_backbone='lseg' requires sem_supervision in "
+                                 "{'lseg' (legacy), 'patch_mean' (native)}.")
+            if (prior_method == 'lseg') != (sem_supervision == 'lseg'):
+                raise ValueError("lseg: use legacy (prior_method='lseg' + "
+                                 "sem_supervision='lseg') OR new (prior_method='native' + "
+                                 "sem_supervision='patch_mean') — do not mix.")
         else:
             if prior_method not in ('proxy_clip', 'native'):
                 raise ValueError(
@@ -342,6 +424,47 @@ class OpenSe3rDA3(nn.Module):
             self.lbotv_backbone = None
 
         # ------------------------------------------------------------------
+        # Optional: DINOv3 ViT-L/16 (frozen) — replaces DINOv2 as the
+        # CausalBranch appearance stream.  Same dual-stream setup as 'lbotv':
+        # the semantic backbone (TIPS/...) still supplies the input prior +
+        # DPT cond + distillation GT.  Weights are the official Meta release
+        # (license-gated download; hub loader accepts a local .pth via
+        # `weights=`).  ViT-L embed_dim 1024 matches the CausalBranch DINO
+        # slot exactly — no projector.
+        # ------------------------------------------------------------------
+        if dino_backbone == 'dinov3':
+            _dv3_repo = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'thirdparty', 'dinov3'
+            )
+            if not os.path.isfile(dinov3_ckpt):
+                raise FileNotFoundError(
+                    f"dinov3_ckpt not found: {dinov3_ckpt}\n"
+                    f"DINOv3 weights are license-gated — download "
+                    f"dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth after accepting "
+                    f"the license (Meta form or HF facebook/dinov3-vitl16-pretrain-"
+                    f"lvd1689m) and pass --dinov3_ckpt.")
+            self.dinov3_backbone = torch.hub.load(
+                _dv3_repo, 'dinov3_vitl16', source='local',
+                pretrained=True, weights=dinov3_ckpt)
+            if self.dinov3_backbone.embed_dim != 1024:
+                raise ValueError(
+                    f"dinov3 backbone embed_dim {self.dinov3_backbone.embed_dim} "
+                    f"!= 1024; the CausalBranch DINO slot expects ViT-L")
+            self.dinov3_backbone.eval().requires_grad_(False)
+            # DINOv3 expects ImageNet-normalized input (same stats as omega/lbotv).
+            self.register_buffer(
+                '_dinov3_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+                persistent=False,
+            )
+            self.register_buffer(
+                '_dinov3_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+                persistent=False,
+            )
+        else:
+            self.dinov3_backbone = None
+
+        # ------------------------------------------------------------------
         # Frozen semantic backbone (LSeg / PE-Core / CLIP)
         # ------------------------------------------------------------------
         self.semantic_backbone = build_semantic_backbone(
@@ -351,6 +474,13 @@ class OpenSe3rDA3(nn.Module):
             proxy_gamma  = proxy_gamma,
         )
         prior_dim = self.semantic_backbone.output_dim
+
+        # Instance-aware semantic head: the residual output dim MUST equal the
+        # semantic backbone's shared-space dim (the base lives in that space).
+        if self.inst_sem_head and self.inst_sem_dim != prior_dim:
+            raise ValueError(
+                f"inst_sem_dim ({self.inst_sem_dim}) must equal "
+                f"semantic_backbone.output_dim ({prior_dim}).")
         if sem_expand is None:
             sem_expand = prior_dim
         self.sem_expand = sem_expand
@@ -457,6 +587,10 @@ class OpenSe3rDA3(nn.Module):
             self.vggt = None
             print("[OpenSe3rDA3] dino_backbone=lbotv → dropped VGGT entirely "
                   "(LingBot-Vision supplies DINO tokens; CausalBranch already init'd from VGGT)")
+        elif self.dino_backbone == 'dinov3':
+            self.vggt = None
+            print("[OpenSe3rDA3] dino_backbone=dinov3 → dropped VGGT entirely "
+                  "(DINOv3 supplies DINO tokens; CausalBranch already init'd from VGGT)")
         else:
             freed = trim_vggt_modules(self.vggt, keep_geometry=False)
             print(f"[OpenSe3rDA3] Freed unused VGGT submodules (geometry from DA3): {freed}")
@@ -537,11 +671,33 @@ class OpenSe3rDA3(nn.Module):
                     box_size_extent_aware = query_box_size_extent_aware,
                     use_fgbg_head   = query_use_fgbg_head,
                     fastsam_mask_prior = query_fastsam_mask_prior,
+                    merge_enable        = query_merge,
+                    merge_layer         = query_merge_layer,
+                    merge_tau           = query_merge_tau,
+                    merge_dist_veto     = query_merge_dist_veto,
+                    merge_act_threshold = query_merge_act_threshold,
                     # metric mode (depth_norm_mode='none') → init box size ~1 m
                     box_init_log_size = (0.0 if depth_norm_mode == 'none' else -1.20397),
+                    # SemProj-on-query is DISABLED: the instance semantic residual
+                    # now comes from the DENSE head (mask-mean of r), not the query
+                    # token (which regressed OOD when overloaded).  Head never builds
+                    # sem_proj → query token unchanged.
+                    inst_sem_head  = False,
+                    inst_sem_dim   = self.inst_sem_dim,
                 )
             else:
                 raise ValueError(f"query_arch must be 'maskformer' or 'mask2former', got '{query_arch}'")
+            # P/Q scorer head (offline-validated recipe; joint training).
+            if use_pq_head:
+                from .pq_head import PQHead
+                self.pq_head = PQHead(sem_dim=sem_dim)
+                # NOTE expose_pq_inputs no longer enabled here: P/Q is computed
+                # IN-HEAD (pq_module passed via head_kw) — the old export of
+                # full-res F_mask through the checkpointed head was the prime
+                # suspect of the stochastic CausalBranch NaN.  The expose flag
+                # remains available for eval tooling (no checkpoint at eval).
+            else:
+                self.pq_head = None
             # Learned pairwise merge head (detached probe; same-instance classifier).
             self.use_merge_head = bool(use_merge_head)
             if self.use_merge_head:
@@ -978,6 +1134,12 @@ class OpenSe3rDA3(nn.Module):
                 lbotv_out   = self.lbotv_backbone(imgs_norm, is_training=True)
                 dino_tokens_flat = lbotv_out['x_norm_patchtokens']                   # [B*T, N16, 1024]
                 dino_tokens = dino_tokens_flat.reshape(B, T, -1, dino_tokens_flat.shape[-1])
+            elif self.dino_backbone == 'dinov3':
+                imgs_flat   = images_01.reshape(B * T, 3, H, W)
+                imgs_norm   = (imgs_flat - self._dinov3_mean) / self._dinov3_std
+                dv3_out     = self.dinov3_backbone(imgs_norm, is_training=True)
+                dino_tokens_flat = dv3_out['x_norm_patchtokens']                     # [B*T, N16, 1024]
+                dino_tokens = dino_tokens_flat.reshape(B, T, -1, dino_tokens_flat.shape[-1])
             elif self.dino_backbone == 'radio':
                 # ONE RADIO forward → raw appearance (→ single-source DINO tokens) and,
                 # in training, dense SigLIP (SCGA+head_mlp) kept ONLY as the distillation
@@ -1011,6 +1173,7 @@ class OpenSe3rDA3(nn.Module):
         #   - otherwise: run the semantic backbone for the input/DPT-cond prior.
         # ------------------------------------------------------------------
         imgs_flat = images_01.reshape(B * T, 3, H, W)
+        _tips_shared = None                     # cached V for TextRegion seeding
         if self.dino_backbone == 'radio':
             lseg_feat = None
         else:
@@ -1022,7 +1185,13 @@ class OpenSe3rDA3(nn.Module):
                         dino_grid   = (patch_h, patch_w),
                     )
                 elif self.prior_method == 'native':
-                    lseg_feat = self.semantic_backbone.forward_prior_native(imgs_flat)
+                    if self.seed_sem == 'textregion':
+                        # ONE encoder pass feeds both consumers: the dense prior
+                        # below and the per-region TextRegion used for seeding.
+                        _tips_shared = self.semantic_backbone.shared_v_forward(imgs_flat)
+                        lseg_feat = self.semantic_backbone.native_from_shared(_tips_shared)
+                    else:
+                        lseg_feat = self.semantic_backbone.forward_prior_native(imgs_flat)
                 else:                                         # 'lseg'
                     lseg_feat = self.semantic_backbone.forward_prior(imgs_flat)
                 if lseg_feat.shape[-2:] != (H, W):
@@ -1187,11 +1356,30 @@ class OpenSe3rDA3(nn.Module):
             return self.semantic_head(
                 list(toks), images_01, patch_start_idx=ps_idx_dpt,
                 semantic_cond=_sem_cond)
-        if self.training:
+        if self._skip_dense_sem and not (self.fastsam_query
+                                         and self.seed_sem == 'dense'):
+            # Dense semantic head disabled (instance-aware semantic head owns the
+            # semantic signal).  Skip the run entirely (self.semantic_head is
+            # still built for ckpt-name compatibility; its params go unused →
+            # DDP find_unused_parameters=True handles that).
+            # EXCEPTION: FastSAM query-seeding pools sem_feat per region to seed
+            # the queries, so when fastsam_query is on the head must still RUN;
+            # only its GT + loss are skipped (dense sem is unsupervised then).
+            sem_feat = sem_conf = sem_feat_expanded = None
+        elif self.training:
             sem_feat, sem_conf, sem_feat_expanded = checkpoint(
                 _sem_head_fwd, *sem_tokens_list, use_reentrant=False)
         else:
             sem_feat, sem_conf, sem_feat_expanded = _sem_head_fwd(*sem_tokens_list)
+
+        # NOTE (--sem_residual): `+ native` is added AFTER the instance-head
+        # dispatch (see below), NOT here.  Adding it here fed `r + native` into
+        # FastSAM seeding, which shifted the seed distribution the instance head
+        # had converged on and cost 26% of the matched-mask IoU mass
+        # (n_matched 100 → 74, never recovered in 8 epochs; identical collapse
+        # in the earlier SemProj-on-query run).  Seeding must keep eating the
+        # head's own output r — at init r ≈ the semconf semantic, so there is no
+        # distribution jump, and r drifts into a residual smoothly.
 
         # Instance head dispatch (mirror of OpenSe3r).
         if self.instance_head_type == 'dense':
@@ -1216,6 +1404,16 @@ class OpenSe3rDA3(nn.Module):
                 if debug_aabb_dump_dir is not None:
                     head_kw['debug_dump_dir']    = debug_aabb_dump_dir
                     head_kw['debug_dump_prefix'] = debug_aabb_dump_prefix
+            # Merge veto (§3.2) needs per-pixel world coords for mask centroids.
+            elif getattr(self.instance_head, 'merge_enable', False):
+                head_kw['world_points'] = world_points
+            if getattr(self, 'pq_head', None) is not None:
+                head_kw['pq_module'] = self.pq_head
+                if self.pq_sem_source == 'textregion':
+                    head_kw['pq_sem_backbone'] = self.semantic_backbone
+                    head_kw['pq_shared'] = _tips_shared
+                elif sem_feat is not None:
+                    head_kw['pq_sem_feat'] = sem_feat.detach()
             # (Idea 2) When head uses external init queries, feed in the
             # processed instance queries from CausalBranch.
             if (getattr(self.instance_head, 'query_init_type', None) == 'external'
@@ -1227,10 +1425,21 @@ class OpenSe3rDA3(nn.Module):
             fastsam_region_conf = None
             if self.fastsam_query:
                 from .fastsam_seg import build_seed_queries
+                # inst_sem_head: the dense head predicts a RESIDUAL r (=sem_feat);
+                # the pre-mask seeding semantic = r + native TIPS prior (detached
+                # inside build_seed_queries).  Otherwise sem_feat is used as-is.
+                _seed_sem = sem_feat
+                if (self.inst_sem_head and sem_feat is not None
+                        and lseg_feat is not None):
+                    _seed_sem = sem_feat + lseg_feat.reshape(
+                        B, T, lseg_feat.shape[1], H, W).to(sem_feat.dtype)
                 seed, fastsam_region_id, fastsam_region_conf = build_seed_queries(
                     self._fastsam_seg, self.region_pool, self.patch_size,
                     self.fastsam_max_regions, images_01, ins_tokens_list,
-                    sem_feat, world_points, ps_idx_dpt,
+                    _seed_sem, world_points, ps_idx_dpt,
+                    sem_backbone=(self.semantic_backbone
+                                  if self.seed_sem == 'textregion' else None),
+                    shared=_tips_shared,
                 )
                 head_kw['init_queries'] = seed
                 if getattr(self.instance_head, 'fastsam_mask_prior', False):
@@ -1253,13 +1462,33 @@ class OpenSe3rDA3(nn.Module):
             else:
                 query_out = self.instance_head(**head_kw)
 
+        # ── Dense semantic RESIDUAL (--sem_residual) ──
+        # AFTER the instance head has run (so FastSAM seeding saw the raw head
+        # output r, unchanged from the semconf distribution) the head output is
+        # reinterpreted as a residual: model semantic = r + native, with the
+        # frozen native-TIPS dense DETACHED so gradient trains only r.  The
+        # existing dense per-pixel textregion loss below then supervises
+        # r + native at every pixel, which is what makes r a well-posed residual.
+        if self.sem_residual and sem_feat is not None and lseg_feat is not None:
+            _native = lseg_feat.reshape(
+                B, T, lseg_feat.shape[1], H, W).to(sem_feat.dtype)
+            if _native.shape[2] != sem_feat.shape[2]:
+                raise ValueError(
+                    f"sem_residual dim mismatch: native {_native.shape[2]} "
+                    f"vs head {sem_feat.shape[2]}")
+            sem_feat = sem_feat + _native.detach()
+            if sem_feat_expanded is not None and sem_feat_expanded.shape[2] == _native.shape[2]:
+                sem_feat_expanded = sem_feat_expanded + _native.detach()
+
         # ------------------------------------------------------------------
         # Semantic GT for the loss (training-time only when supervision != lseg).
         # ------------------------------------------------------------------
         sem_gt = None
         instance_mask = frames.get('instance_mask') if isinstance(frames, dict) else None
         with torch.no_grad():
-            if self.dino_backbone == 'radio':
+            if self._skip_dense_sem:
+                pass                                # dense sem off → no dense GT
+            elif self.dino_backbone == 'radio':
                 # Reuse the SigLIP dense already computed in the single RADIO forward
                 # (no 2nd encoder pass): per-instance hard-mask mean = the pseudo GT.
                 if _radio_dense is not None and instance_mask is not None:
@@ -1279,6 +1508,90 @@ class OpenSe3rDA3(nn.Module):
                     mask_crop_margin = self.mask_crop_margin,
                     mask_crop_mode   = self.mask_crop_mode,
                 )
+
+        # ------------------------------------------------------------------
+        # Instance-aware semantic head: sem = base + SemProj(query) residual.
+        #   base   = frozen-TIPS textregion pooled over each query's PREDICTED
+        #            soft mask (mask-aware, no context bleed).
+        #   target = frozen-TIPS textregion pooled over each GT instance's hard
+        #            one-hot (byte-identical to the legacy textregion GT); passed
+        #            as a dict keyed (b, t, inst_id) so the loss aligns it with
+        #            the Hungarian/sparse matcher's GT ids.
+        # Both use ONE cached shared_v_forward (V + post-attn modules) — reused
+        # for base AND target (same V, different masks).  The base is frozen
+        # (@no_grad in the backbone); only inst_sem_raw carries gradient.
+        # ------------------------------------------------------------------
+        # Instance semantic = textregion(V, predicted mask)  [mask-aware base, frozen]
+        #                    + mask-mean(r, predicted mask)  [DENSE-head residual, grad].
+        # r = the dense semantic head output (sem_feat); the query token is NOT
+        # touched (unlike the earlier SemProj-on-query design that regressed OOD).
+        inst_sem = None
+        inst_sem_target = None
+        if (self.inst_sem_head and query_out is not None
+                and sem_feat is not None):
+            sb = self.semantic_backbone
+            Dout = sb.output_dim
+            with torch.no_grad():
+                shared = sb.shared_v_forward(imgs_flat)                 # V cached once
+                ph, pw = shared['patch_h'], shared['patch_w']
+                v_dtype = shared['v'].dtype
+                # ── base: per-query soft-mask pool ──
+                soft = query_out['mask_logits'].sigmoid()              # [B,T,N,H,W]
+                Nq = soft.shape[2]
+                base = torch.zeros(B, T, Nq, Dout,
+                                   device=soft.device, dtype=v_dtype)
+                for b in range(B):
+                    for t in range(T):
+                        idx = b * T + t
+                        sm = soft[b, t].to(v_dtype)                    # [N,H,W]
+                        sm_low = F.interpolate(
+                            sm.unsqueeze(0), (ph, pw),
+                            mode='bilinear', align_corners=False,
+                        ).squeeze(0).reshape(Nq, ph * pw)              # [N, ph*pw]
+                        base[b, t] = sb.textregion_from_shared(
+                            shared, sm_low, frame_idx=idx)
+                # ── target: per-GT-instance hard one-hot pool ──
+                if instance_mask is not None:
+                    inst_sem_target = {}
+                    for b in range(B):
+                        for t in range(T):
+                            idx = b * T + t
+                            inst = instance_mask[b, t]
+                            ids = inst.unique()
+                            ids = ids[ids > 0]
+                            if ids.numel() == 0:
+                                continue
+                            # Chunk one-hot downsample (mirror textregion GT).
+                            _rows = []
+                            for _c0 in range(0, ids.numel(), 128):
+                                _ck = ids[_c0:_c0 + 128]
+                                _oh = (inst.unsqueeze(0) == _ck.view(-1, 1, 1)).to(v_dtype)
+                                _rows.append(F.interpolate(
+                                    _oh.unsqueeze(0), (ph, pw),
+                                    mode='bilinear', align_corners=False,
+                                ).squeeze(0).reshape(_ck.numel(), ph * pw))
+                            mask_low = torch.cat(_rows, 0).clamp(0, 1)
+                            keep = mask_low.sum(dim=-1) > 0
+                            if keep.sum() == 0:
+                                continue
+                            mask_low = mask_low[keep]
+                            ids = ids[keep]
+                            feats = sb.textregion_from_shared(
+                                shared, mask_low, frame_idx=idx)       # [num_gt, Dout]
+                            for k, iid in enumerate(ids.tolist()):
+                                inst_sem_target[(b, t, int(iid))] = feats[k]
+            # residual = per-query soft-mask MEAN of the dense head output r
+            # (= sem_feat), OUTSIDE no_grad so gradient flows into the dense head.
+            # sem = textregion base (frozen) + mask-mean(r) (grad).
+            soft_ml = query_out['mask_logits'].sigmoid().detach()        # [B,T,N,H,W] (weights only)
+            res_rows = []
+            for b in range(B):
+                for t in range(T):
+                    r_flat = sem_feat[b, t].reshape(Dout, -1).t().to(base.dtype)   # [HW, D] (grad → dense head)
+                    sm = soft_ml[b, t].reshape(Nq, -1).to(base.dtype)             # [N, HW] (detached)
+                    res_rows.append((sm @ r_flat) / sm.sum(-1, keepdim=True).clamp(min=1e-6))
+            res = torch.stack(res_rows).reshape(B, T, Nq, Dout)          # [B,T,N,D]
+            inst_sem = base + res
 
         # ------------------------------------------------------------------
         # Assemble predictions (same schema as OpenSe3r)
@@ -1313,6 +1626,12 @@ class OpenSe3rDA3(nn.Module):
             predictions['descriptor']  = query_out['descriptor']
             if 'fgbg_logits' in query_out:
                 predictions['fgbg_logits'] = query_out['fgbg_logits']    # [B,T,N] thing/stuff
+            # Instance-aware semantic head: sem [B,T,N,D] + per-GT target dict.
+            if inst_sem is not None:
+                predictions['inst_sem'] = inst_sem
+                if inst_sem_target is not None:
+                    # dict keyed (b,t,inst_id)→[D]; loss aligns via matcher ids.
+                    predictions['inst_sem_target'] = inst_sem_target
             if self.fastsam_query and fastsam_region_id is not None:
                 predictions['fastsam_region_id']   = fastsam_region_id
                 predictions['fastsam_region_conf'] = fastsam_region_conf
@@ -1334,6 +1653,21 @@ class OpenSe3rDA3(nn.Module):
                 predictions['box_mode']  = query_out.get('box_mode', 'aabb')
             if 'aux_outputs' in query_out:
                 predictions['aux_outputs'] = query_out['aux_outputs']
+            # Mid-decoder merge outputs — REQUIRED by the loss (allowed-OR +
+            # follower exclusion), eval and SLAM follower gating; omitting them
+            # silently disables all three (they use .get(..., None)).
+            if 'active_mask' in query_out:
+                predictions['active_mask']  = query_out['active_mask']      # [B,T,N] bool
+                predictions['merge_assign'] = query_out['merge_assign']     # [B,T,N] long
+            # P/Q head inputs (expose_pq_inputs; detached) — same whitelist
+            # rule as active_mask: forgetting this silently no-ops the scorer.
+            if '_pq_qnorm' in query_out:
+                predictions['_pq_qnorm'] = query_out['_pq_qnorm']
+                predictions['_pq_fmask'] = query_out['_pq_fmask']
+            if 'pq_p' in query_out:
+                predictions['pq_p'] = query_out['pq_p']
+                predictions['pq_q'] = query_out['pq_q']
+                predictions['pq_valid'] = query_out['pq_valid']
         if sem_gt is not None:
             predictions['_sem_feat_gt'] = sem_gt
             if self.sem_supervision == 'lseg':
@@ -1398,8 +1732,17 @@ class OpenSe3rDA3(nn.Module):
     def init_kv_cache(self) -> List:
         # A fresh cache list marks a new streaming sequence — also wipe the
         # optional STAC/H2O temporal KV manager (no-op when not registered).
+        # [ma-slam local patch: opense3r/stac_kv + causal_branch.register_kv_mgr]
         self.causal_branch.reset_kv_mgr()
         return self.causal_branch.init_kv_cache()
+
+    def set_merge_active(self, active: bool):
+        """Curriculum switch for the mid-decoder query merge (§4): trainer sets
+        `epoch >= merge_start_epoch`; SLAM/inference sets True right after load.
+        No-op unless the head was built with query_merge=True."""
+        head = getattr(self, 'instance_head', None)
+        if head is not None and getattr(head, 'merge_enable', False):
+            head.merge_active = bool(active)
 
     @torch.no_grad()
     def forward_chunk(

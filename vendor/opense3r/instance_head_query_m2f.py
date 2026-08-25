@@ -111,9 +111,13 @@ class _SelfAttentionLayer(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, queries, query_pos):
+    def forward(self, queries, query_pos, key_padding_mask=None):
+        # key_padding_mask [B, N] bool, True = exclude as KEY (merged followers:
+        # leaders must not attend stale absorbed fragments; followers still act
+        # as queries — their outputs are ignored downstream).
         q = k = queries + query_pos
-        out, _ = self.attn(q, k, queries, need_weights=False)
+        out, _ = self.attn(q, k, queries, need_weights=False,
+                           key_padding_mask=key_padding_mask)
         return self.norm(queries + self.dropout(out))
 
 
@@ -606,6 +610,36 @@ class Mask2FormerQueryInstanceHead(nn.Module):
         # in-domain-robust FastSAM region, then the decoder refines.  Requires
         # fastsam_query + fastsam_region_id passed to forward().  Default off.
         fastsam_mask_prior:        bool = False,
+        # ── Mid-decoder query merge (DESIGN_INSTANCE_HEAD_OTM_MERGE.md §3) ──
+        # After `merge_layer`'s prediction, cluster active queries by descriptor
+        # cosine (leaders = high objectness, greedy, leader-only affinity, 3D
+        # centroid veto), absorb followers into leaders (zero-init residual so
+        # activation == identity), union the cluster masks into the next layer's
+        # cross-attn prior, and deactivate followers (self-attn key padding +
+        # excluded from final output via 'active_mask').  Training curriculum:
+        # the runtime switch `self.merge_active` (set per-epoch by the trainer,
+        # always True in SLAM) gates the whole block; merge decisions (affinity,
+        # leader score, weights) are fully detached.
+        merge_enable:              bool  = False,
+        merge_layer:               int   = 5,     # merge after this layer's _predict
+        merge_tau:                 float = 0.9,   # desc-cosine threshold (precision-first)
+        merge_dist_veto:           float = 1.5,   # max centroid distance (m); 0/None = off
+        merge_act_threshold:       float = 0.1,   # min σ(obj) to participate
+        # P/Q head support (opense3r/pq_head.py): when True, stash the
+        # FINAL-layer decoder-normed queries + pixel-decoder mask features
+        # (both DETACHED) into the output dict ('_pq_qnorm'/'_pq_fmask') so
+        # the external PQ scorer can inspect the head's own work.  Zero
+        # behavior change when off.
+        expose_pq_inputs:          bool  = False,
+        # ── Instance-aware semantic head (RESIDUAL on a frozen-TIPS base) ──
+        # When True, a gated 3-layer MLP on the FINAL decoder query produces a
+        # per-query semantic RESIDUAL `inst_sem_raw` [B,T,N,inst_sem_dim].  The
+        # model adds the frozen-TIPS textregion base (pooled over the query's
+        # predicted soft mask) → sem = base + SemProj(q).  Last layer zero-init
+        # so training starts at sem = base.  inst_sem_dim MUST equal the
+        # semantic_backbone.output_dim (TIPS-v2-l14 = 1024).
+        inst_sem_head:             bool  = False,
+        inst_sem_dim:              int   = 1024,
     ):
         super().__init__()
         if intermediate_layer_idx is None:
@@ -797,7 +831,41 @@ class Mask2FormerQueryInstanceHead(nn.Module):
         # Thing/stuff (foreground/background) head — per-query binary logit.
         self.use_fgbg_head = bool(use_fgbg_head)
         self.fgbg_head = nn.Linear(d_model, 1) if use_fgbg_head else None
+
+        # ── Instance-aware semantic head (residual MLP) ──
+        # 3-layer MLP q → inst_sem_dim; LAST layer zero-init so the head emits a
+        # zero residual at start (sem = base).  Only built when enabled.
+        self.inst_sem_head = bool(inst_sem_head)
+        self.inst_sem_dim  = int(inst_sem_dim)
+        if self.inst_sem_head:
+            self.sem_proj = _MLP(d_model, d_model, self.inst_sem_dim, num_layers=3)
+            with torch.no_grad():
+                self.sem_proj.layers[-1].weight.zero_()
+                self.sem_proj.layers[-1].bias.zero_()
+        else:
+            self.sem_proj = None
         self.fastsam_mask_prior = bool(fastsam_mask_prior)   # ESAM-style SAM mask prior (no params)
+
+        # ── Mid-decoder query merge (§3) ──
+        self.merge_enable        = bool(merge_enable)
+        self.merge_layer         = int(merge_layer)
+        self.merge_tau           = float(merge_tau)
+        self.merge_dist_veto     = float(merge_dist_veto or 0.0)
+        self.merge_act_threshold = float(merge_act_threshold)
+        self.merge_active        = False    # runtime curriculum switch (trainer/SLAM sets)
+        self.expose_pq_inputs    = bool(expose_pq_inputs)
+        if self.merge_enable:
+            if not (0 <= self.merge_layer < n_layers - 1):
+                raise ValueError(f"merge_layer must leave >=1 refinement layer: "
+                                 f"got {self.merge_layer} with n_layers={n_layers}")
+            # Follower-feature projection; ZERO-init so merge activation is an
+            # exact identity (z = q_leader + Σ w·W·q_follower, W=0 at start).
+            # NOTE deliberate deviation from the design doc's LN(q + Σ...):
+            # LN(q) != q would break identity-at-activation.
+            self.merge_proj = nn.Linear(d_model, d_model, bias=False)
+            nn.init.zeros_(self.merge_proj.weight)
+        else:
+            self.merge_proj = None
 
     # ─────────────────────────────────────────────────────────────────────
     # Prediction heads: shared between initial pred and every layer's pred.
@@ -925,6 +993,120 @@ class Mask2FormerQueryInstanceHead(nn.Module):
         block = block.unsqueeze(1).repeat(1, self.n_heads, 1, 1).flatten(0, 1)
         return block.detach()                                          # [BT*nh, N, h*w]
 
+    def _merge_queries(
+        self,
+        queries:      torch.Tensor,           # [BT, N, d]   post-merge_layer features
+        mask_logits:  torch.Tensor,           # [BT, N, H, W] merge_layer prediction
+        objectness:   torch.Tensor,           # [BT, N]
+        descriptor:   torch.Tensor,           # [BT, N, D]   L2-normed
+        attn_mask:    torch.Tensor,           # [BT*nh, N, h*w] next layer's prior (True=block)
+        attn_size:    tuple,                  # (h, w) of attn_mask
+        world_points: Optional[torch.Tensor], # [BT, H, W, 3] or None (veto off)
+    ):
+        """Within-frame leader-based query merge (§3.3–3.6).
+
+        query-scan sequential greedy: iterate active queries by descending
+        σ(obj); affinity is computed ONLY against existing leaders (no
+        transitive chains); a follower joins the argmax leader iff cosine >
+        merge_tau AND centroid distance ≤ merge_dist_veto (both centroids
+        valid).  All decisions detached.  Returns (queries, attn_mask,
+        follower_mask [BT,N] True=absorbed, assign [BT,N] leader index).
+        """
+        BT, N, _ = queries.shape
+        dev = queries.device
+        r     = objectness.detach().sigmoid()                          # [BT, N]
+        desc  = descriptor.detach()                                    # unit vecs
+        probs = mask_logits.detach().sigmoid()                         # [BT, N, H, W]
+
+        # per-query 3D centroid from thresholded mask (invalid → no veto → no merge)
+        cent = None
+        cent_ok = torch.zeros(BT, N, dtype=torch.bool, device=dev)
+        if world_points is not None and self.merge_dist_veto > 0:
+            hard = (probs > 0.5).float()                               # [BT, N, H, W]
+            wp = world_points
+            if wp.shape[1:3] != probs.shape[2:4]:
+                wp = F.interpolate(wp.permute(0, 3, 1, 2),
+                                   size=probs.shape[2:4], mode='nearest'
+                                   ).permute(0, 2, 3, 1)
+            npix = hard.sum(dim=(2, 3))                                # [BT, N]
+            cent = torch.einsum('bnhw,bhwc->bnc', hard, wp) / npix.clamp_min(1).unsqueeze(-1)
+            cent_ok = npix > 0
+
+        follower_mask = torch.zeros(BT, N, dtype=torch.bool, device=dev)
+        assign = torch.arange(N, device=dev).unsqueeze(0).repeat(BT, 1)  # [BT, N]
+        w_flat = torch.zeros(BT, N, device=dev)     # follower weight w̃ = cos·r (0 for non-followers)
+
+        for b in range(BT):
+            act = (r[b] > self.merge_act_threshold).nonzero(as_tuple=True)[0]
+            if act.numel() < 2:
+                continue
+            order = act[torch.argsort(r[b, act], descending=True)]
+            leaders: List[int] = []
+            for j in order.tolist():
+                merged = False
+                if leaders:
+                    lead_t = torch.tensor(leaders, device=dev)
+                    cos = desc[b, lead_t] @ desc[b, j]                 # [n_lead]
+                    if self.merge_dist_veto > 0:
+                        if cent is None or not bool(cent_ok[b, j]):
+                            cos = torch.full_like(cos, -1.0)           # unverifiable → no merge
+                        else:
+                            dist = (cent[b, lead_t] - cent[b, j]).norm(dim=-1)
+                            veto = (~cent_ok[b, lead_t]) | (dist > self.merge_dist_veto)
+                            cos = cos.masked_fill(veto, -1.0)
+                    best = int(cos.argmax())
+                    if float(cos[best]) > self.merge_tau:
+                        li = leaders[best]
+                        follower_mask[b, j] = True
+                        assign[b, j] = li
+                        w_flat[b, j] = float(cos[best]) * float(r[b, j])
+                        merged = True
+                if not merged:
+                    leaders.append(j)
+
+        if not follower_mask.any():
+            return queries, attn_mask, follower_mask, assign
+
+        # ── feature merge: z_l = q_l + Σ_j w̄_lj · W · q_j  (W zero-init) ──
+        # scatter follower contributions onto their leaders; weights normalized
+        # per leader over its followers.  All weights detached scalars.
+        proj = self.merge_proj(queries)                                # [BT, N, d]
+        wsum = torch.zeros(BT, N, device=dev)
+        wsum.scatter_add_(1, assign, w_flat)                           # per-leader Σw
+        w_norm = w_flat / wsum.gather(1, assign).clamp_min(1e-6)       # [BT, N]
+        w_norm = w_norm * follower_mask.float()
+        contrib = torch.zeros_like(queries)
+        contrib.scatter_add_(1, assign.unsqueeze(-1).expand_as(proj),
+                             proj * w_norm.unsqueeze(-1))
+        queries = queries + contrib
+
+        # ── attention prior union (weighted max, §3.5) at attn resolution ──
+        # follower prob weighted by w̃ = cos·r (UN-normalized, ≤1); leader = 1.
+        h, w = attn_size
+        p = F.interpolate(probs, size=(h, w), mode='bilinear',
+                          align_corners=False)                         # [BT, N, h, w]
+        wp_ = torch.where(follower_mask, w_flat,
+                          torch.ones_like(w_flat))                     # [BT, N]
+        p_w = p * wp_.view(BT, N, 1, 1)
+        union = torch.zeros_like(p)
+        union.scatter_reduce_(1, assign.view(BT, N, 1, 1).expand_as(p_w),
+                              p_w, reduce='amax')
+        # leader rows get the union; follower rows keep their own prior (they
+        # still run through late layers but are ignored downstream).
+        _nfol = torch.zeros(BT, N, device=dev)
+        _nfol.scatter_add_(1, assign, follower_mask.float())
+        is_leader_merged = _nfol > 0                                   # [BT, N]
+        new_block = (union < 0.5).flatten(2)                           # [BT, N, h*w]
+        old_block = attn_mask.view(BT, self.n_heads, N, h * w)[:, 0]   # [BT, N, h*w]
+        take = is_leader_merged.unsqueeze(-1)
+        blk = torch.where(take, new_block, old_block)
+        allblk = blk.all(dim=-1)
+        if allblk.any():
+            blk = blk.clone()
+            blk[allblk] = False
+        attn_mask = blk.unsqueeze(1).repeat(1, self.n_heads, 1, 1).flatten(0, 1).detach()
+        return queries, attn_mask, follower_mask, assign
+
     # ─────────────────────────────────────────────────────────────────────
     def forward(
         self,
@@ -936,6 +1118,12 @@ class Mask2FormerQueryInstanceHead(nn.Module):
         debug_dump_dir:     Optional[str] = None,            # if set, dumps per-frame PCA / pred / mask-pts PLY (world_aabb only)
         debug_dump_prefix:  str = '',
         init_queries:       Optional[torch.Tensor] = None,   # [B, N_q, *] external init (Idea 2)
+        pq_module:          Optional[torch.nn.Module] = None,  # model-level PQHead: compute P/Q
+                                                               # IN-HEAD (small outputs cross the
+                                                               # checkpoint boundary, not F_mask)
+        pq_sem_feat:        Optional[torch.Tensor] = None,     # [B,T,C,Hf,Wf] detached sem feat
+        pq_sem_backbone     = None,   # TextRegion P/Q: frozen teacher (None = dense pooling)
+        pq_shared:          Optional[dict] = None,   # TextRegion P/Q: cached shared_v_forward
         fastsam_region_id:  Optional[torch.Tensor] = None,   # [B,T,H,W] or [BT,H,W] long: per-pixel
                                                              # FastSAM region id (query i ↔ region i,
                                                              # -1=none).  Used iff fastsam_mask_prior.
@@ -1023,6 +1211,10 @@ class Mask2FormerQueryInstanceHead(nn.Module):
         all_boxes       = [box]
 
         # ── Decoder layer stack (with cyclic multi-scale + masked attention) ──
+        follower_mask = None                   # [BT, N] bool, set at merge point
+        merge_assign  = None                   # [BT, N] long leader index
+        do_merge = (self.merge_enable and self.merge_active
+                    and self.merge_proj is not None)
         for i in range(self.n_layers):
             level = i % L
 
@@ -1031,7 +1223,8 @@ class Mask2FormerQueryInstanceHead(nn.Module):
                 query_pos=query_pos, memory_pos=memory_pos_per_level[level],
                 attn_mask=attn_mask,
             )
-            queries = self.self_attn_layers[i](queries, query_pos)
+            queries = self.self_attn_layers[i](queries, query_pos,
+                                               key_padding_mask=follower_mask)
             queries = self.ffn_layers[i](queries)
 
             next_level = (i + 1) % L
@@ -1054,6 +1247,18 @@ class Mask2FormerQueryInstanceHead(nn.Module):
             all_descriptors.append(desc)
             all_boxes      .append(box)
 
+            # ── Mid-decoder merge (§3): consume THIS layer's (supervised)
+            # prediction, consolidate N fragment queries → K object queries,
+            # union the cluster priors, deactivate followers for layers > i. ──
+            if do_merge and i == self.merge_layer and not is_final:
+                queries, attn_mask, follower_mask, merge_assign = \
+                    self._merge_queries(
+                        queries, m_logits, obj, desc,
+                        attn_mask, sizes[next_level], wp_bt,
+                    )
+                if not follower_mask.any():
+                    follower_mask = None       # keep self-attn fast path
+
         # ── Assemble outputs ──
         # Last entry = final prediction; earlier entries = auxiliary supervision.
         def _shape_bt_to_bt(x, *rest):
@@ -1069,6 +1274,103 @@ class Mask2FormerQueryInstanceHead(nn.Module):
         if self.fgbg_head is not None:
             final['fgbg_logits'] = _shape_bt_to_bt(
                 self.fgbg_head(queries).squeeze(-1), self.num_queries)            # [B, T, N]
+        # Instance-aware semantic RESIDUAL from the FINAL decoder queries.
+        # The frozen-TIPS base is added in the model → final sem = base + this.
+        if self.sem_proj is not None:
+            final['inst_sem_raw'] = _shape_bt_to_bt(
+                self.sem_proj(queries), self.num_queries, self.inst_sem_dim)      # [B, T, N, inst_sem_dim]
+        # ── Merge outputs (§3.6/§3.7): active_mask True = alive proposal
+        # (leaders + unmerged); merge_assign = leader index per query (own
+        # index if not a follower).  Consumers: loss (post-merge OTO with
+        # allowed-OR + follower exclusion) and inference proposal filtering.
+        if pq_module is not None:
+            # P/Q computed HERE (inside the possibly-checkpointed head) so only
+            # [B,T,N] logits leave the boundary — the previous design exported
+            # full-res F_mask through the checkpoint (prime NaN-trigger suspect).
+            from .pq_head import build_pq_inputs
+            _dev_t = 'cuda' if queries.is_cuda else 'cpu'
+            with torch.autocast(device_type=_dev_t, enabled=False):
+                qn_f = self.decoder_norm(queries).detach().float()        # [BT,N,D]
+                mlf  = all_mask_logits[-1].detach().float()               # [BT,N,H,W]
+                Fm_f = F_mask.detach().float()
+                semf = (pq_sem_feat.reshape(BT, *pq_sem_feat.shape[2:]).detach().float()
+                        if pq_sem_feat is not None else None)   # None in TextRegion mode
+                _pps, _pqs, _pvs = [], [], []
+                for _i in range(BT):
+                    # feat_1x1 stays inside @no_grad build (it stays a FROZEN
+                    # random projection): routing the raw 256ch crop through
+                    # pq_module.forward to train it re-triggered the trunk-NaN
+                    # memory corruption (official run died 06:06 iter<400;
+                    # the 17ch-crop bf16 config survived 400+). JL-projection
+                    # crops are what offline dump-era heads learned on anyway.
+                    _inp, _val = build_pq_inputs(mlf[_i], Fm_f[_i], qn_f[_i],
+                                                 feat_1x1=pq_module.feat_1x1)
+                    _semp = None
+                    if pq_module.proj_sem is not None:
+                        if pq_sem_backbone is not None and pq_shared is not None:
+                            # TextRegion P/Q: pool the frozen teacher's V under
+                            # this query's soft mask.  Same quantity the dense
+                            # branch below approximates ("what does this query's
+                            # region mean"), but mask-aware -- and it is what the
+                            # instance semantics are read out with, so P/Q now
+                            # scores the representation it actually ranks.  It
+                            # also lets the dense head be dropped entirely.
+                            _th, _tw = pq_shared['patch_h'], pq_shared['patch_w']
+                            _pr = F.interpolate(mlf[_i].sigmoid().unsqueeze(1),
+                                                size=(_th, _tw), mode='bilinear',
+                                                align_corners=False)[:, 0]
+                            # The teacher's cached V is bf16 while this whole P/Q
+                            # block runs with autocast DISABLED (fp32), so the
+                            # pooling has to be re-entered under bf16 or the
+                            # post-attention matmuls hit mixed dtypes.
+                            with torch.autocast(device_type=_dev_t,
+                                                dtype=torch.bfloat16, enabled=True):
+                                _semp = pq_sem_backbone.textregion_from_shared(
+                                    pq_shared, _pr.flatten(1).clamp(min=0), frame_idx=_i)
+                            _semp = F.normalize(_semp.float(), dim=-1)
+                        else:
+                            _sf = semf[_i]
+                            _pr = F.interpolate(mlf[_i].sigmoid().unsqueeze(1),
+                                                size=_sf.shape[-2:], mode='bilinear',
+                                                align_corners=False)[:, 0]
+                            _w = _pr.flatten(1)
+                            _semp = (_w @ _sf.flatten(1).t()) / _w.sum(1, keepdim=True).clamp_min(1e-6)
+                            _semp = F.normalize(_semp, dim=-1)
+                    # bf16 for the pq_module call ONLY: the fp32 conv
+                    # backward kernels here corrupt memory on this rig
+                    # (bisect 2026-07-28: loss-detached survives, backward
+                    # kills trunk) — bf16 dispatches different kernels.
+                    with torch.autocast(device_type=_dev_t, dtype=torch.bfloat16,
+                                        enabled=True):
+                        _pl, _ql = pq_module(_inp['q_norm'], _inp['pooled'],
+                                             _inp['crop'], _inp['scale'],
+                                             sem_pooled=_semp)
+                    _pl, _ql = _pl.float(), _ql.float()
+                    _pps.append(_pl); _pqs.append(_ql); _pvs.append(_val)
+            final['pq_p'] = _shape_bt_to_bt(torch.stack(_pps), self.num_queries)
+            final['pq_q'] = _shape_bt_to_bt(torch.stack(_pqs), self.num_queries)
+            final['pq_valid'] = _shape_bt_to_bt(torch.stack(_pvs), self.num_queries)
+            # Targeted sync: 6/6 async runs NaN'd stochastically in the
+            # CausalBranch while fully-synchronized runs (forensic /
+            # CUDA_LAUNCH_BLOCKING) survive — a kernel in/near this block
+            # (roi_align / index ops) appears to corrupt memory when overlapped.
+            # This fence costs ~nothing per chunk and closes that window.
+            if queries.is_cuda:
+                torch.cuda.synchronize()
+        if self.expose_pq_inputs:
+            # final-layer q_norm (post decoder_norm, matching _predict's view)
+            final['_pq_qnorm'] = _shape_bt_to_bt(
+                self.decoder_norm(queries).detach(), self.num_queries, -1)
+            final['_pq_fmask'] = F_mask.detach().reshape(
+                B, T, *F_mask.shape[1:])                                     # [B,T,C,H,W]
+        if self.merge_enable:
+            if follower_mask is None:
+                follower_mask = torch.zeros(BT, self.num_queries, dtype=torch.bool,
+                                            device=queries.device)
+                merge_assign = torch.arange(self.num_queries, device=queries.device
+                                            ).unsqueeze(0).repeat(BT, 1)
+            final['active_mask']  = _shape_bt_to_bt(~follower_mask, self.num_queries)
+            final['merge_assign'] = _shape_bt_to_bt(merge_assign, self.num_queries)
         # ── Path-B-only descriptor (memory path) for the aux contrastive loss.
         # Depends only on q_mem (constant across decoder layers) → computed once.
         if self.desc_dual_path and self.desc_pathB_aux and q_mem_bt is not None:

@@ -31,7 +31,7 @@ variable per-frame region count.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -128,7 +128,8 @@ class GeoAwareRegionPooling(nn.Module):
 
     def _forward_one(self, causal: torch.Tensor, sem: torch.Tensor,
                      xyz: torch.Tensor, region_id: torch.Tensor,
-                     num_regions: int) -> torch.Tensor:
+                     num_regions: int,
+                     sem_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Single frame.
 
         Args:
@@ -154,13 +155,22 @@ class GeoAwareRegionPooling(nn.Module):
         w = self.pts_proj2(torch.cat([z_local, z_glob[idx]], dim=-1)) * 2.0  # [n,1]
 
         f_app = _scatter_mean(causal * w, idx, num_regions)          # [M, causal_dim]
-        f_sem = _scatter_mean(sem * w,    idx, num_regions)          # [M, sem_dim]
+        if sem_regions is not None:
+            # TextRegion seeding: the semantic half of the seed is already a
+            # per-REGION vector (mask-weighted V pool over the frozen teacher),
+            # so there is nothing to average -- pooling it again over patches
+            # would re-introduce the context bleed TextRegion exists to remove.
+            f_sem = sem_regions[:num_regions]                        # [M, sem_dim]
+        else:
+            f_sem = _scatter_mean(sem * w,    idx, num_regions)      # [M, sem_dim]
         q = self.seed_mlp(torch.cat([f_app, f_sem, z_glob], dim=-1)) # [M, d_model]
         return q
 
     def forward(self, causal: torch.Tensor, sem: torch.Tensor,
                 xyz: torch.Tensor, region_id: torch.Tensor,
-                max_queries: int) -> Tuple[torch.Tensor, torch.Tensor]:
+                max_queries: int,
+                sem_regions: Optional[torch.Tensor] = None,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Pool a batch of frames into padded seed queries.
 
         Args:
@@ -189,7 +199,8 @@ class GeoAwareRegionPooling(nn.Module):
             if present.numel() == 0:
                 continue
             M = int(present.max().item()) + 1
-            q = self._forward_one(causal[b], sem[b], xyz[b], rid, M)   # [M, d_model]
+            q = self._forward_one(causal[b], sem[b], xyz[b], rid, M,
+                                  None if sem_regions is None else sem_regions[b])
             m = min(M, max_queries)
             seed[b, :m] = q[:m]
             # A slot is valid only if at least one patch was assigned to it.

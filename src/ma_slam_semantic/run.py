@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from ma_slam_semantic.config import SemConfig, ensure_opense3r
+from ma_slam_semantic.config import SemConfig, ensure_opense3r, DEFAULT_CKPT
 from ma_slam_semantic.bridge import gt_chunks, gt_seq_box_scale
 from ma_slam_semantic.sem_model import SemanticModel
 from ma_slam_semantic.proposals import make_proposals
@@ -222,6 +222,15 @@ def main():
     ap.add_argument("--conf_gate_coef", type=float, default=1.0,
                     help="[ma] scale on the per-submap mean-conf validity gate "
                          "(<1 keeps more points -> more coverage, noisier voxels)")
+    ap.add_argument("--ckpt", default=DEFAULT_CKPT,
+                    help="semantic checkpoint: a CKPTS name (semconf | semconf_pq | a1) "
+                         "or a .pth path; architecture is read from the checkpoint")
+    ap.add_argument("--ranker", default="p_top25q", choices=["obj", "p_top25q", "pq", "max"],
+                    help="export cluster confidence (p_top25q needs the P/Q head; "
+                         "falls back to objectness otherwise)")
+    ap.add_argument("--sem_agg", default="auto", choices=["auto", "dense", "textregion"],
+                    help="per-proposal semantic source: dense-head mask-mean or "
+                         "frozen-TIPS textregion pool (auto = by checkpoint)")
     ap.add_argument("--kv_policy", default="none", choices=["none", "window", "h2o"],
                     help="CausalBranch KV retention: 'none' (flat, unbounded), "
                          "'window' (flat trim), 'h2o' (STAC temporal compression: "
@@ -250,15 +259,16 @@ def main():
                      h2o_recent_frames=a.h2o_recent, h2o_hh_frames=a.h2o_hh,
                      h2o_decay=a.h2o_decay, h2o_subsample=a.h2o_subsample)
 
+    model_kwargs = dict(ckpt=a.ckpt, ranker=a.ranker, sem_agg=a.sem_agg)
     if a.geometry == "ma":
         cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef,
-                        **kv_kwargs)
+                        **kv_kwargs, **model_kwargs)
         run_ma_slam(a, cfg)
         return
 
     cfg = SemConfig(chunk_size=a.chunk_size, box_scale_mode="gt_seq_median",
                     save_2d_masks=a.save_2d_masks, mask_2d_top_k=a.mask_top_k,
-                    **kv_kwargs)
+                    **kv_kwargs, **model_kwargs)
     name = a.name or os.path.basename(os.path.normpath(a.data))
     os.makedirs(a.out, exist_ok=True)
 
@@ -283,7 +293,8 @@ def main():
                 frame_start=chunk["frame_indices"][0],
                 out_dir=os.path.join(a.out, "2d_inst_masks"),
                 demo_name=name, top_k=cfg.mask_2d_top_k)
-        props, pix_map, pts_hd = make_proposals(out, chunk, cfg)
+        props, pix_map, pts_hd = make_proposals(out, chunk, cfg,
+                                                sem_backbone=model.semantic_backbone)
         for t, key in enumerate(chunk["frame_keys"]):
             resolver.register(key, pts_hd[t])
         table.match_chunk(props, chunk["frame_keys"], pix_map)

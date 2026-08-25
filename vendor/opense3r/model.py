@@ -81,8 +81,28 @@ def fill_invalid_world_points(world_points, valid):
     H, W = world_points.shape[-3], world_points.shape[-2]
     v   = valid.reshape(*lead, H * W, 1).to(world_points.dtype)
     wpf = world_points.reshape(*lead, H * W, 3)
-    mean = (wpf * v).sum(dim=-2, keepdim=True) / v.sum(dim=-2, keepdim=True).clamp(min=1.0)
-    out = torch.where(v.bool(), wpf, mean)
+    import os as _os
+    if _os.environ.get('WP_FILL_LEGACY') == '1':
+        # exact pre-6cb3a0c behavior for the cluster-quality bisect: a frame
+        # with any non-finite px under the mask NaNs wholesale -> its
+        # proposals vanish downstream (the July-baseline behavior).
+        mean = (wpf * v).sum(dim=-2, keepdim=True) / v.sum(dim=-2, keepdim=True).clamp(min=1.0)
+        out = torch.where(v.bool(), wpf, mean)
+        return out.reshape(*lead, H, W, 3)
+    vb  = v.bool()
+    # ⚠️ Must be torch.where, NOT `wpf * v`: a single inf/NaN at an INVALID
+    # pixel (depth hole, degenerate K) becomes inf*0 = NaN in the sum, the
+    # frame mean turns NaN, and every invalid pixel is then filled with NaN —
+    # i.e. the whole frame's world_points die.  With pos3d_cond that NaN
+    # enters the CausalBranch input and the entire trunk output goes NaN
+    # ("all inputs finite but pred[world_points] NAN", the resume-nan saga).
+    wp_safe = torch.where(vb, wpf, torch.zeros_like(wpf))
+    mean = wp_safe.sum(dim=-2, keepdim=True) / v.sum(dim=-2, keepdim=True).clamp(min=1.0)
+    out = torch.where(vb, wpf, mean)
+    if not torch.isfinite(out).all():
+        # non-finite survivors sit on VALID pixels (bad GT depth/intrinsics).
+        # Zero them rather than letting one pixel kill the batch.
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return out.reshape(*lead, H, W, 3)
 
 
@@ -1377,6 +1397,14 @@ class OpenSe3r(nn.Module):
             # Deep-supervision aux outputs (Mask2Former arch only):
             if 'aux_outputs' in query_out:
                 predictions['aux_outputs'] = query_out['aux_outputs']
+            # Mid-decoder merge outputs (see model_da3 note): loss/eval/SLAM
+            # follower handling silently no-ops without these keys.
+            if 'active_mask' in query_out:
+                predictions['active_mask']  = query_out['active_mask']      # [B,T,N] bool
+                predictions['merge_assign'] = query_out['merge_assign']     # [B,T,N] long
+            if '_pq_qnorm' in query_out:
+                predictions['_pq_qnorm'] = query_out['_pq_qnorm']
+                predictions['_pq_fmask'] = query_out['_pq_fmask']
         if sem_gt is not None:
             predictions['_sem_feat_gt'] = sem_gt
             # Legacy alias — keeps old loss / inference scripts working.
@@ -1464,6 +1492,7 @@ class OpenSe3r(nn.Module):
     def init_kv_cache(self) -> List:
         # A fresh cache list marks a new streaming sequence — also wipe the
         # optional STAC/H2O temporal KV manager (no-op when not registered).
+        # [ma-slam local patch: opense3r/stac_kv + causal_branch.register_kv_mgr]
         self.causal_branch.reset_kv_mgr()
         return self.causal_branch.init_kv_cache()
 

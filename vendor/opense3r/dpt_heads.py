@@ -150,6 +150,25 @@ class FeatureDPTHead(nn.Module):
         else:
             self.expander = None
 
+    def _sanitise_conf(self, conf: torch.Tensor) -> torch.Tensor:
+        """conf is a sigmoid ⇒ mathematically in (0,1]; any non-finite value is a
+        numerical artifact, and it is NOT harmless.  In training the semantic loss
+        takes log(conf), so a single bad pixel NaNs the whole loss and (just above
+        0) emits huge-but-finite gradients — the mechanism that poisoned Adam and
+        froze the semantic path (autopsy 2026-08-02).  At inference a NaN conf
+        poisons the voxel's running mean for the rest of the sequence, and a NaN
+        feature scores equal against every text query so argmax silently returns
+        class 0 (found on 3/8 Replica scenes, 2026-08-17).
+        """
+        if not torch.isfinite(conf).all():
+            if not getattr(self, '_conf_nan_warned', False):
+                self._conf_nan_warned = True
+                print(f'[conf-nan] semantic conf had '
+                      f'{int((~torch.isfinite(conf)).sum())} non-finite px '
+                      f'-> sanitised; further occurrences silent', flush=True)
+            conf = torch.nan_to_num(conf, nan=1e-4, posinf=1.0, neginf=1e-4)
+        return conf.clamp(1e-4, 1.0)
+
     def forward(
         self,
         output_tokens_list: List[torch.Tensor],   # list of [B, T, N_patch, causal_dim]
@@ -204,7 +223,7 @@ class FeatureDPTHead(nn.Module):
             feat        = self.ps_out_proj(feat_mid)                 # [B*T, out_C, H, W]
             conf_logits = self.ps_conf_proj(x)                       # [B*T,    p², ph, pw]
             conf = F.pixel_shuffle(conf_logits, self.patch_size)     # [B*T, 1, H, W]
-            conf = torch.sigmoid(conf) + 1e-6
+            conf = self._sanitise_conf(torch.sigmoid(conf) + 1e-6)
             feat = feat.reshape(B, T, *feat.shape[1:])
             conf = conf.reshape(B, T, *conf.shape[1:])
         else:
@@ -239,7 +258,7 @@ class FeatureDPTHead(nn.Module):
             # dpt_feat: [B*T, 256, H, W]
 
             feat = self.out_proj(dpt_feat)              # [B*T, out_channels, H, W]
-            conf = self.conf_head(dpt_feat) + 1e-6      # [B*T, 1, H, W]
+            conf = self._sanitise_conf(self.conf_head(dpt_feat) + 1e-6)
 
             feat = feat.reshape(B, T, *feat.shape[1:])
             conf = conf.reshape(B, T, *conf.shape[1:])

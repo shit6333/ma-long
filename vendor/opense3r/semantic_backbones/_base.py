@@ -128,6 +128,35 @@ class VLMBackboneBase(nn.Module):
         prepped = self._prep(images_01)
         return self._v_forward(prepped)
 
+    @torch.no_grad()
+    def textregion_from_shared(
+        self,
+        shared:    dict,
+        masks_low: torch.Tensor,        # [N, ph*pw]  per-region weights (soft or hard)
+        frame_idx: int = 0,
+    ) -> torch.Tensor:
+        """Per-region TextRegion features from a CACHED shared_v_forward output.
+
+        Reuses one `shared_v_forward` (V + post-attn modules) to pool ANY set of
+        masks at the patch grid — used for BOTH the instance-aware head's
+        per-query base (soft predicted masks) and the per-GT-instance target
+        (hard one-hot).  `masks_low` is at the shared patch grid
+        (shared['patch_h'] × shared['patch_w']); a GT one-hot call reproduces
+        the legacy `textregion_supervision_per_frame` target byte-identically.
+
+        `shared['v']` is [N, num_heads, S_seq, head_dim] (N = BT); we slice ONE
+        frame and strip special (CLS + register) tokens unless already stripped
+        (multi_res_v_forward sets 'cls_stripped').
+
+        Returns [N_regions, output_dim].
+        """
+        from .text_region_attn import textregion_regions
+        v = shared['v']                                  # [N, num_heads, S_seq, head_dim]
+        v_f = v[frame_idx]                               # [num_heads, S_seq, head_dim]
+        if (not shared.get('cls_stripped', False)) and self.n_special > 0:
+            v_f = v_f[:, self.n_special:, :]             # strip CLS + register along S_seq
+        return textregion_regions(v_f, masks_low.to(v_f.dtype), shared)
+
     # ------------------------------------------------------------------
     # Multi-resolution V forward (TextRegion-style)
     # ------------------------------------------------------------------

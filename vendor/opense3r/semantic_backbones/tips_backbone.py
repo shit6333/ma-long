@@ -212,6 +212,13 @@ class TIPSBackbone(VLMBackboneBase):
 
         return {
             'v':             v,
+            # pre-norm1 token stream of the last block.  Kept so the dense
+            # native prior can be rebuilt from THIS forward (see
+            # `native_from_shared`) instead of running the whole encoder a
+            # second time -- native and TextRegion differ only in the tail:
+            # native = proj(V) + x, TextRegion = pool(V) with the x residual
+            # dropped.  Everything before that is shared.
+            'x':             x,
             'patch_h':       ph,
             'patch_w':       pw,
             'last_block':    last_block,
@@ -223,6 +230,34 @@ class TIPSBackbone(VLMBackboneBase):
             'final_norm':    self.tips.norm,                   # top-level final LayerNorm
             'final_proj':    None,                             # no projection (output_dim = embed_dim)
         }
+
+    @torch.no_grad()
+    def native_from_shared(self, shared: dict) -> torch.Tensor:
+        """Dense native prior from a CACHED `shared_v_forward` output.
+
+        Byte-for-byte the tail of `forward_prior_native`, but reading `v`/`x`
+        from `shared` instead of re-running the encoder.  With this, ONE TIPS
+        forward feeds all three consumers: the causal branch's dense prior, the
+        per-region TextRegion used to seed queries, and the per-mask TextRegion
+        used for the instance semantics.
+
+        Returns [B, C, ph, pw].
+        """
+        v = shared['v']                                   # [B, heads, S_seq, head_dim]
+        x = shared['x']                                   # [B, S_seq, embed_dim]
+        B, _, n_dim, _ = v.shape
+        last_block = shared['last_block']
+        v_out = v.transpose(1, 2).reshape(B, n_dim, self.embed_dim)
+        v_out = shared['attn_out_proj'](v_out)
+        v_out = shared['ls1'](v_out)
+        x_val = v_out + x
+        y_val = shared['mlp_norm'](x_val)
+        y_val = shared['ls2'](shared['mlp'](y_val))
+        x_val = x_val + y_val
+        x_val = shared['final_norm'](x_val)
+        patches = x_val[:, self.n_special:, :]            # drop CLS + registers
+        ph, pw = shared['patch_h'], shared['patch_w']
+        return patches.reshape(B, ph, pw, -1).permute(0, 3, 1, 2).contiguous()
 
     @torch.no_grad()
     def forward_prior_native(self, images_01: torch.Tensor) -> torch.Tensor:

@@ -71,6 +71,15 @@ def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
     color_map = color_map_for_table(table, mode="desc")
     print(f"[export] noise filter dropped {len(dropped)}/{len(table)}")
 
+    # cluster confidence: the writers own the formula (_record_cluster_score);
+    # 'p_top25q' silently falls back to objectness on records without P/Q — say so.
+    n_pq = sum(1 for r in table.records.values() if r.has_pq)
+    agg, pq_rank = {"obj": ("mean", False), "max": ("max", False),
+                    "pq": ("mean", True), "p_top25q": ("p_top25q", False)}[cfg.ranker]
+    print(f"[export] ranker={cfg.ranker} (writer agg={agg}) | records with P/Q: "
+          f"{n_pq}/{len(table)}" + ("  ** NO P/Q on any record -> objectness ranking **"
+                                    if cfg.ranker != "obj" and n_pq == 0 else ""))
+
     paths = {}
     paths["voxels_ply"] = os.path.join(out_dir, f"{name}_query_instance_voxels.ply")
     export_query_instance_voxels_ply(mem, paths["voxels_ply"], transformation=transformation,
@@ -85,7 +94,8 @@ def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
                              dropped_ids=dropped, verbose=True)
     paths["labels_npz"] = os.path.join(out_dir, f"{name}_instance_labels.npz")
     dump_instance_labels_npz(mem, paths["labels_npz"], transformation=transformation,
-                             dropped_ids=dropped, verbose=True, objectness_agg="mean")
+                             dropped_ids=dropped, verbose=True, objectness_agg=agg,
+                             pq_rank=pq_rank)
     paths["sem_queries_npz"] = os.path.join(out_dir, f"{name}_instance_sem_queries.npz")
     dump_instance_sem_queries_npz(mem, paths["sem_queries_npz"],
                                   dropped_ids=dropped, verbose=True)

@@ -1,11 +1,13 @@
 """Configuration for ma_slam_semantic.
 
-Two layers, mirroring the reference run
-``outputs/slam_opense3r_query/scannet_gt8_fastsam/005_..._conf032_gt/005_run_args.json``:
+Two layers:
 
-- ``FROZEN_MODEL_ARGS`` — the architecture + weight args consumed by
-  ``slam_opense3r.run.load_model``. These MUST match the checkpoint (it is loaded
-  ``strict=False``, so a mismatch fails *silently*). Do not tune.
+- **Checkpoint** (``CKPTS`` / ``SemConfig.ckpt``) — the model ARCHITECTURE is no
+  longer configured here. ``sem_model`` builds it from the checkpoint's own stored
+  args, corrected against the weights (``semantic_mapping.model``): the
+  ``FROZEN_MODEL_ARGS`` table this file used to carry could only describe one
+  model and was loaded ``strict=False`` (mismatches failed silently — see
+  docs/opense3r_model_handoff.md §0/§5).
 - ``SemConfig`` — the ~20 tunable pipeline knobs (proposal formation, instance
   matching, noise filter, KV policy), defaults = the reference run's values.
 """
@@ -14,7 +16,6 @@ from __future__ import annotations
 
 import os
 import sys
-from argparse import Namespace
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -27,18 +28,18 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 VENDOR_ROOT = os.path.join(_REPO_ROOT, "vendor")
 OPENSE3R_ROOT = os.environ.get("OPENSE3R_ROOT", VENDOR_ROOT)
 
-# weight files per root: the vendored copies are renamed under vendor/weights/
-# (gitignored); the live repo keeps its original scattered locations.
+# frozen-backbone weight files per root: the vendored copies are renamed under
+# vendor/weights/ (gitignored); the live repo keeps its original locations.
+# (The checkpoint's own stored paths are relative to the OpenSe3r repo, so they
+# must be overridden per root — see sem_model.build_model_from_ckpt.)
 _WEIGHTS = {
     "vendor": dict(
-        ckpt_path=os.path.join(VENDOR_ROOT, "weights/opense3r_fastsam_query_semconf.pth"),
         vggt_ckpt=os.path.join(VENDOR_ROOT, "weights/vggt_1b.pt"),
         fastsam_ckpt=os.path.join(VENDOR_ROOT, "weights/fastsam_x.pt"),
         # TIPS npz is found module-relatively (tips/pytorch/checkpoints/ holds
         # relative symlinks into vendor/weights/) — no path arg needed.
     ),
     "live": dict(
-        ckpt_path="{root}/outputs/opense3r_fastsam_query_semconf/checkpoint-last.pth",
         vggt_ckpt="{root}/checkpoints/VGGT.pt",
         fastsam_ckpt="/mnt/HDD4/ricky/sam_test/FastSAM-x.pt",
     ),
@@ -60,67 +61,42 @@ def ensure_opense3r(root: str = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Frozen model args (arch flags verbatim from 005_run_args.json, paths absolutized).
-# backend='da3' + gt_geo_input=True builds OpenSe3rDA3 WITHOUT the DA3 geometry
-# backbone — geometry always enters externally via forward_semantic, which is exactly
-# the contract ma_slam feeds. dino_backbone='vggt' still loads VGGT for DINOv2 tokens.
+# Checkpoint registry (docs/opense3r_model_handoff.md). Named variants resolve per
+# root; ``SemConfig.ckpt`` also accepts a bare path.
+#   semconf     ep44 naive semconf — the golden-gate reference (pre-P/Q)
+#   semconf_pq  + P/Q ranking head on the SAME trunk (paper numbers; descfix ckpt:
+#               its stored args say query_descriptor_mlp_layers=0 but the file
+#               carries 3 layers -> arch must be inferred from the WEIGHTS)
+#   a1          textregion seeding, dense semantic head REMOVED (semantic_feat is
+#               None -> proposals pool frozen-TIPS textregion instead); training
+#               until ~2026-08-28, P/Q head to be added afterwards
 # ---------------------------------------------------------------------------
-FROZEN_MODEL_ARGS = dict(
-    backend="da3",
-    gt_geo_input=True,           # skip DA3 geometry backbone (external geometry)
-    # ckpt_path / vggt_ckpt / fastsam_ckpt are filled per-root by model_args()
-    # (vendor/weights/* renamed copies, or the live repo's original locations).
-    da3_ckpt="checkpoints/da3_large",             # unused (geometry backbone skipped)
-    lbotv_ckpt="checkpoints/lingbot_vision_vitl",  # unused (dino_backbone=vggt)
-    lseg_ckpt="checkpoints/demo_e200.ckpt",       # unused (tips semantic backbone)
-    # encoders / causal branch
-    dino_backbone="vggt",
-    semantic_backbone="tips-v2-l14",
-    prior_method="native",
-    sem_supervision="textregion",
-    depth_norm_mode="chunk",
-    gt_anchor_mode="se3",
-    depth_cond=False,
-    point_cond=False,
-    pose_cond=False,
-    rope_mode="2d",
-    rope_voxel_size=0.1,
-    no_head_sem_cond=True,
-    use_sem_conf_head=True,
-    sem_channels="0,768",
-    ins_channels="512,1024",
-    sem_dim=1024,
-    ins_dim=16,
-    n_blocks=12,
-    pos3d_cond=True,
-    no_depth_cross_attn=True,
-    # query instance head (Mask2Former, FastSAM-seeded external queries)
-    instance_head_type="query",
-    query_arch="mask2former",
-    query_init_type="external",
-    num_instance_queries=0,
-    instance_query_block_indices=None,
-    instance_queries_init_type="learnable",
-    query_num_queries=100,
-    query_d_model=256,
-    query_c_mask=256,
-    query_descriptor_dim=256,
-    query_n_heads=8,
-    query_n_layers=9,
-    query_num_feature_levels=3,
-    query_descriptor_mlp_layers=3,
-    query_use_box_head=False,
-    query_box_mode="aabb",
-    query_box_size_anchor=False,
-    query_box_query_only=False,
-    query_fastsam_mask_prior=False,
-    query_box_size_extent_aware=False,
-    use_merge_head=False,
-    fastsam_query=True,
-    fastsam_conf=0.2,
-    fastsam_iou=0.9,
-    fastsam_max_regions=100,
-)
+CKPTS = {
+    "vendor": dict(
+        semconf=os.path.join(VENDOR_ROOT, "weights/opense3r_fastsam_query_semconf.pth"),
+        semconf_pq=os.path.join(VENDOR_ROOT, "weights/opense3r_semconf_pq_descfix.pth"),
+        a1=os.path.join(VENDOR_ROOT, "weights/opense3r_a1.pth"),
+    ),
+    "live": dict(
+        semconf="{root}/outputs/opense3r_fastsam_query_semconf/checkpoint-last.pth",
+        semconf_pq="{root}/outputs/opense3r_pq_only_on_semconf/checkpoint-last-descfix.pth",
+        a1="{root}/outputs/opense3r_fastsam_query_a1/checkpoint-last.pth",
+    ),
+}
+DEFAULT_CKPT = "semconf_pq"
+
+
+def resolve_ckpt(name_or_path: str, root: str = None) -> str:
+    """Named variant (``CKPTS``) -> path for the active root; paths pass through."""
+    root = root or OPENSE3R_ROOT
+    if name_or_path and (os.path.sep in name_or_path or name_or_path.endswith(".pth")):
+        return name_or_path
+    table = (CKPTS["vendor"] if os.path.abspath(root) == os.path.abspath(VENDOR_ROOT)
+             else {k: v.format(root=root) for k, v in CKPTS["live"].items()})
+    if name_or_path not in table:
+        raise KeyError(f"unknown checkpoint {name_or_path!r}; expected one of "
+                       f"{sorted(table)} or a .pth path")
+    return table[name_or_path]
 
 
 @dataclass
@@ -129,6 +105,16 @@ class SemConfig:
 
     opense3r_root: str = OPENSE3R_ROOT
     device: str = "cuda"
+    ckpt: str = DEFAULT_CKPT                      # CKPTS name or a .pth path
+    # cluster confidence at export (semantic_mapping.stages.ranking): 'p_top25q' =
+    # meanP x mean(top-25% Q) — needs the P/Q head, falls back to objectness
+    # automatically (and LOUDLY, see export) on checkpoints without it. 'obj' =
+    # mean objectness (the pre-P/Q baseline).
+    ranker: str = "p_top25q"
+    # per-proposal semantic vector (sem_query): 'auto' = mask-mean of the dense
+    # semantic head when the model runs one, else frozen-TIPS textregion pool over
+    # the predicted masks (A1 removed the dense head). 'dense' / 'textregion' force.
+    sem_agg: str = "auto"
     resolution: Tuple[int, int] = (518, 336)      # (W, H) — must match training
     attn_mode: str = "causal"
     # frames per causal batch. KV-causal => results are batching-invariant; this is
@@ -204,15 +190,14 @@ class SemConfig:
     save_2d_masks: bool = False
     mask_2d_top_k: int = 15
 
-    def model_args(self) -> Namespace:
-        """The frozen args as the Namespace ``slam_opense3r.run.load_model`` expects,
-        with weight paths resolved for the active OpenSe3r root."""
-        args = dict(FROZEN_MODEL_ARGS)
-        args["da3_ckpt"] = os.path.join(self.opense3r_root, args["da3_ckpt"])
-        args["lbotv_ckpt"] = os.path.join(self.opense3r_root, args["lbotv_ckpt"])
-        args["lseg_ckpt"] = os.path.join(self.opense3r_root, args["lseg_ckpt"])
-        args.update(_weight_paths(self.opense3r_root))
-        return Namespace(**args)
+    @property
+    def ckpt_path(self) -> str:
+        return resolve_ckpt(self.ckpt, self.opense3r_root)
+
+    def backbone_paths(self) -> dict:
+        """Frozen-backbone weight files for the active root (override the
+        repo-relative paths stored inside the checkpoint)."""
+        return _weight_paths(self.opense3r_root)
 
     @property
     def patch_size(self) -> int:

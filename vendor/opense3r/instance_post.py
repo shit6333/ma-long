@@ -104,6 +104,9 @@ def resolve_per_pixel(
     score_threshold: float = 0.25,
     sem_conf:    Optional[torch.Tensor] = None,    # [N] logits; if given, per-pixel
                                                    # ownership score = σ(obj)·σ(sem_conf)
+    select_scores: Optional[torch.Tensor] = None,  # [N] PROBS; if given, overrides the
+                                                   # ownership argmax key entirely (gate /
+                                                   # activity threshold stays obj-only)
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Resolve which kept slot owns each pixel using `objectness × mask_prob`
     (× sem_conf when given → A' helps pick which slot owns contested pixels).
@@ -127,7 +130,11 @@ def resolve_per_pixel(
     mask_probs = mask_logits.sigmoid()                          # [N, H, W]
     obj_probs  = objectness.sigmoid()                           # [N]
     gate_scores = obj_probs.view(-1, 1, 1) * mask_probs         # [N, H, W]  obj-only (recall)
-    if sem_conf is not None:
+    if select_scores is not None:
+        sel_scores = select_scores.view(-1, 1, 1) * mask_probs
+        best_slot  = sel_scores.argmax(dim=0)
+        best_score = gate_scores.max(dim=0).values              # activity stays obj-only
+    elif sem_conf is not None:
         # sem_conf picks WHICH slot owns each pixel (argmax), but the activity
         # threshold stays on the obj-only score so recall is unchanged — else the
         # low-valued σ(sem_conf) drags the product under score_threshold and pixels
@@ -406,6 +413,52 @@ def process_chunk_to_proposals(
                                                         # top-K, NMS winner — but NOT the recall threshold (which stays
                                                         # pure obj).  Lets A' pick the better mask among competitors
                                                         # without tightening recall.  Independent of gate/rank.
+    # ── Phase B: P/Q decoupled scorer (joint-trained pq_head) ──
+    # obj entangled thingness×quality only in the pre-is_bg era; the PQ
+    # lineage moves quality into Q, so the three roles split:
+    #   GATE   = σ(P)            (thingness; compared vs obj_threshold)
+    #   FILTER = σ(Q) ≥ pq_q_min (per-observation mask quality)
+    #   SELECT/RANK = σ(P)·σ(Q)  (NMS winner, top-K, stored score →
+    #                             cluster_score = mean(P·Q) downstream)
+    pq_p:            Optional[torch.Tensor] = None,     # [T, N] logits
+    pq_q:            Optional[torch.Tensor] = None,     # [T, N] logits
+    pq_valid:        Optional[torch.Tensor] = None,     # [T, N] bool (empty-mask slots False)
+    use_pq:          bool = False,
+    pq_rank_only:    bool = False,                      # rank mode: gate/select/NMS stay obj;
+                                                        # ONLY the stored score = σ(P)·σ(Q)
+                                                        # → cluster_score = mean(P·Q).
+                                                        # (0011 same-cluster A/B: obj 35.1 → P·Q 63.8 AP50;
+                                                        #  P·Q as NMS/select score picks bad winners = the
+                                                        #  full-mode collapse, so keep selection on obj.)
+    pq_q_min:        float = 0.0,                       # 0 = no quality filter
+    admission_mode:  str = 'thing',                     # 'thing' (P-gate, current) | 'stuff'
+                                                        # (E4 pass-2: σ(P)<stuff_p_max AND
+                                                        # σ(Q)>=stuff_q_min — good bg segments
+                                                        # the thing gate rejects)
+    stuff_q_min:     float = 0.5,                       # stuff admission: min σ(Q)
+    stuff_p_max:     float = 0.5,                       # stuff admission: max σ(P)
+    exclude_mask:    Optional[torch.Tensor] = None,     # [T,H,W] bool — pixels already claimed
+                                                        # by the thing pass; stuff proposals may
+                                                        # not touch them (thing-priority rule)
+    thing_p_veto:    Optional[float] = None,            # thing mode + stuff layer on: divert
+                                                        # σ(P)<veto proposals OUT of the thing
+                                                        # pass (they fall through to the stuff
+                                                        # pass) — P is the bg router, obj keeps
+                                                        # doing admission. None = off.
+    gate_combine:    str = 'none',                      # 'none'|'or'|'and': combine the
+                                                        # working-score gate with a SECOND
+                                                        # gate on raw objectness ('or' =
+                                                        # union admission, recovers hard
+                                                        # objects Q rejects; 'and' = strict)
+    gate_second:     'Optional[torch.Tensor]' = None,   # [T,N] raw obj logits (pre-swap)
+    gate_second_thr: float = 0.5,
+    nms_score_source: str = 'score',                    # 'score' | 'q' | 'pq' — key for NMS
+                                                        # ranking + top-K + pixel ownership
+                                                        # ONLY (admission gate & member score
+                                                        # untouched).  Duplicates of one object
+                                                        # tie on thingness P; Q (predicted mask
+                                                        # IoU) breaks the tie toward the cleaner
+                                                        # mask.  E2 of the P/Q role split.
 ) -> Tuple[List[Dict], torch.Tensor]:
     """Per-frame: objectness filter → NMS → argmax → 3D lift.
 
@@ -424,6 +477,17 @@ def process_chunk_to_proposals(
     """
     T, N, H, W = mask_logits.shape
     device = mask_logits.device
+    if admission_mode == 'stuff':
+        if pq_q is None:
+            raise RuntimeError("admission_mode='stuff' needs pq outputs")
+        # Stuff working score = σ(Q): admitted stuff has σ(P)<p_max by
+        # construction, so σ(P)·mask_prob would fail score_threshold at pixel
+        # ownership and every stuff pixel would die.  Q>=q_min clears it
+        # naturally.  (E2's select-key prohibition is about THING internal
+        # wars — temporal desc consistency — which the stuff pool doesn't
+        # have; member scores of stuff records are never exported to AP.)
+        objectness = pq_q
+
     proposals: List[Dict] = []
     pixel_to_proposal = torch.full((T, H, W), -1, dtype=torch.long, device=device)
 
@@ -454,7 +518,47 @@ def process_chunk_to_proposals(
         obj_probs_sel = base_t
         if sem_conf is not None and sem_conf_select:
             obj_probs_sel = obj_probs_sel * sem_conf[t].sigmoid()
-        active = obj_probs_gate > obj_threshold                       # [N] bool (recall = obj)
+        _pq_on = use_pq and pq_p is not None and pq_q is not None
+        if _pq_on:
+            _p_t = pq_p[t].sigmoid()
+            _q_t = pq_q[t].sigmoid()
+            obj_probs_gate = _p_t                                     # gate on thingness
+            obj_probs_sel  = _p_t * _q_t                              # select/rank on P·Q
+        if nms_score_source != 'score':
+            if pq_q is None:
+                raise RuntimeError("--inst_nms_score q/pq needs pq outputs "
+                                   "(run with --use_pq_head)")
+            _q_t = pq_q[t].sigmoid()
+            if nms_score_source == 'q':
+                obj_probs_sel = _q_t
+            else:                                                     # 'pq'
+                obj_probs_sel = (pq_p[t].sigmoid() if pq_p is not None
+                                 else base_t) * _q_t
+        if admission_mode == 'stuff':
+            if pq_p is None or pq_q is None:
+                raise RuntimeError("admission_mode='stuff' needs pq outputs "
+                                   "(run with --use_pq_head)")
+            active = ((pq_p[t].sigmoid() < stuff_p_max)
+                      & (pq_q[t].sigmoid() >= stuff_q_min))
+            if pq_valid is not None:
+                active = active & pq_valid[t].bool()
+        else:
+            active = obj_probs_gate > obj_threshold                   # [N] bool (recall = obj | σ(P))
+            if gate_combine != 'none' and gate_second is not None:
+                _g2nd = gate_second[t].sigmoid() > gate_second_thr
+                active = (active | _g2nd) if gate_combine == 'or' else (active & _g2nd)
+            if thing_p_veto is not None and pq_p is not None:
+                # P routes bg OUT of the thing layer (diverted slots re-enter
+                # via the stuff pass, whose pixels come from the leftovers).
+                active = active & (pq_p[t].sigmoid() >= thing_p_veto)
+        # Q member-quality filter: standalone (works under score_source='p'
+        # too, not only full pq mode).  σ(Q) = predicted per-frame mask IoU;
+        # observations below the floor never enter the InstanceTable, so they
+        # cannot pollute the cluster's desc/voxel running averages.
+        if pq_q is not None and pq_q_min > 0:
+            active = active & (pq_q[t].sigmoid() >= pq_q_min)
+        if _pq_on and pq_valid is not None:
+            active = active & pq_valid[t].bool()                      # empty-mask slots out
         if obj_top_k is not None and obj_top_k < N:
             top_idx = obj_probs_sel.topk(int(obj_top_k)).indices       # top-K by SELECT score
             top_mask = torch.zeros_like(active)
@@ -483,17 +587,22 @@ def process_chunk_to_proposals(
         sem_feat_t = sem_feat[t] if sem_feat is not None else None    # [D, H, W] or None
         if panoptic:
             best_slot_local, _, pixel_active = resolve_per_pixel(
-                mask_logits[t, kept_slots], objectness[t, kept_slots], keep_mask[t],
+                mask_logits[t, kept_slots], objectness[t, kept_slots],
+                (keep_mask[t] & ~exclude_mask[t]) if exclude_mask is not None else keep_mask[t],
                 score_threshold=score_threshold,
                 sem_conf=(sem_conf[t, kept_slots]
                           if (sem_conf is not None and sem_conf_select) else None),
+                select_scores=(obj_probs_sel[kept_slots]
+                               if nms_score_source != 'score' else None),
             )
             def _slot_pixels(kl):
                 return (best_slot_local == kl) & pixel_active
         else:
             kept_sig = mask_logits[t, kept_slots].sigmoid()            # [N_kept, H, W]
             def _slot_pixels(kl):
-                return (kept_sig[kl] > sp_score_thr) & keep_mask[t]
+                km_t = ((keep_mask[t] & ~exclude_mask[t])
+                        if exclude_mask is not None else keep_mask[t])
+                return (kept_sig[kl] > sp_score_thr) & km_t
 
         # 4) For each kept slot that owns ≥1 pixel, lift to 3D
         for k_local in range(kept_slots.numel()):
@@ -520,6 +629,16 @@ def process_chunk_to_proposals(
             _obj = float(objectness[t, slot_global].sigmoid().item())
             if sem_conf is not None and sem_conf_rank:
                 _obj *= float(sem_conf[t, slot_global].sigmoid().item())   # obj×A' → cluster_score
+            if pq_p is not None and pq_q is not None:
+                # record P/Q on every proposal whenever available (diagnostics
+                # + offline re-ranking) — independent of whether they're USED.
+                prop['pq_p'] = float(pq_p[t, slot_global].sigmoid().item())
+                prop['pq_q'] = float(pq_q[t, slot_global].sigmoid().item())
+            if _pq_on and 'pq_p' in prop:   # NOT pq_rank_only: that mode must not
+                                            # perturb clustering (see 2026-08-02)
+                # stored score = σ(P)·σ(Q) → mean_objectness machinery yields
+                # cluster_score = mean(P·Q) with zero downstream changes.
+                _obj = prop['pq_p'] * prop['pq_q']
             prop['objectness'] = _obj
 
             # Predicted bbox: convert camera-canonical → world AABB and
@@ -805,6 +924,8 @@ def _proposal_pair_score_dict(
     w_desc: float, w_vox: float, w_geo: float,
     w_sem:  float, w_box: float,
     sigma_dist: float,
+    geo_cue: str = 'dist',
+    geo_n0: float = 5.0,
     vox_gate:  Optional[float] = None,
     desc_gate: Optional[float] = None,
     sem_gate_thr: float = 0.0,
@@ -922,6 +1043,21 @@ def _proposal_pair_score_dict(
         sim_geo = _aabb_iou(box_iou_mode,
                             p['pred_bbox_min'], p['pred_bbox_max'],
                             q['pred_bbox_min'], q['pred_bbox_max'])
+    elif geo_cue == 'g2' and 'voxels' in p and 'voxels' in q:
+        # G2 envelope containment: fraction of the NEW observation's voxels
+        # lying inside (a ±1-dilated) accumulated occupancy of the record,
+        # scaled by record maturity.  Replaces the point-to-AABB distance
+        # kernel (outlier-fragile box, no shape, kills young records).
+        _qv = q['voxels']
+        _hit = 0
+        for _v in p['voxels']:
+            if _v in _qv or any((_v[0]+dx, _v[1]+dy, _v[2]+dz) in _qv
+                                for dx, dy, dz in ((1,0,0),(-1,0,0),(0,1,0),
+                                                  (0,-1,0),(0,0,1),(0,0,-1))):
+                _hit += 1
+        _cont = _hit / max(len(p['voxels']), 1)
+        _mat = min(1.0, q.get('rec_count', geo_n0) / max(geo_n0, 1e-6))
+        sim_geo = _cont * _mat
     else:
         dist    = _spatial_distance_for_pair(p, q)
         sim_geo = math.exp(-dist / max(sigma_dist, 1e-6))

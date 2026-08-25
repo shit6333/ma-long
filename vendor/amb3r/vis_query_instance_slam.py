@@ -528,6 +528,34 @@ def export_query_instance_boxes_ply(
 # Metadata dump
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _record_cluster_score(rec, objectness_agg: str = 'mean',
+                          pq_rank: bool = False) -> float:
+    """Per-instance confidence for AP ranking (export-side ONLY — never feed
+    P/Q back into prop['objectness']: that perturbs matching/running averages,
+    i.e. changes the CLUSTERS).
+
+    'p_top25q' = meanP × mean(top-quartile Q) — the validated Phase-B recipe
+    (2026-08-05: ScanNet-5 +2.9 AP50, SceneNN-12 wins all metrics vs obj).
+    P is view-stable thingness → mean is calibrated; Q is per-view mask
+    quality → mean dilutes true objects by their many hard views (junk has
+    no good views to be saved by), so the top-25% quantile asks "how good
+    are this cluster's BEST views".  Falls back to objectness when the run
+    recorded no member P/Q.
+    """
+    _mp = getattr(rec, 'member_pq_p', None)
+    _mq = getattr(rec, 'member_pq_q', None)
+    _has_pq = bool(_mp) and bool(_mq) and len(_mp) == len(_mq)
+    if objectness_agg == 'p_top25q' and _has_pq:
+        _top = sorted(_mq)[-max(1, len(_mq) // 4):]
+        return float((sum(_mp) / len(_mp)) * (sum(_top) / len(_top)))
+    if pq_rank and _has_pq:
+        _pq = [a * b for a, b in zip(_mp, _mq)]
+        return float(max(_pq) if objectness_agg == 'max'
+                     else sum(_pq) / len(_pq))
+    return float(rec.max_objectness if objectness_agg == 'max'
+                 else rec.mean_objectness)
+
+
 def dump_instance_labels_npz(
     memory,                                          # OpenSe3rQueryMemory
     save_file:      str,
@@ -536,6 +564,11 @@ def dump_instance_labels_npz(
     verbose:        bool                    = False,
     objectness_agg: str                     = 'mean',   # 'mean' | 'max' — how to
                                                         # aggregate member objectness into cluster_score
+    pq_rank:        bool                    = False,    # Phase B rank-only: score = agg(σ(P)·σ(Q))
+    extra_table                             = None,     # E4 stuff InstanceTable: its voxels are
+                                                        # merged with THING PRIORITY (thing voxels
+                                                        # overwrite stuff on overlap) — combined
+                                                        # instsem export only, never the AP NPZ
 ) -> dict:
     """Export the SLAM voxel → inst_id map in the NPZ format expected by
     `eval_instance_npz_scannet.py`.
@@ -554,6 +587,10 @@ def dump_instance_labels_npz(
     """
     table = memory.instance_table
     vmap  = table.voxel_to_inst_map()         # dict[(vx,vy,vz) → inst_id]
+    if extra_table is not None:
+        merged = extra_table.voxel_to_inst_map()
+        merged.update(vmap)                   # thing overwrites stuff on overlap
+        vmap = merged
     centers_np, ids_np = _voxel_centers(table.voxel_size, vmap)
 
     if centers_np.shape[0] == 0:
@@ -579,16 +616,17 @@ def dump_instance_labels_npz(
     # Per-instance confidence — uses `mean_objectness` (head's per-frame
     # objectness post-σ, running-averaged across all merged proposals).
     # Skip dropped instances so they don't pollute the eval's pred list.
+    _pq_rank = bool(pq_rank)
+    _all_recs = dict(table.records)
+    if extra_table is not None:
+        _all_recs.update(extra_table.records)     # ids disjoint via id_offset
     score_ids, score_vals = [], []
-    for iid in sorted(table.records.keys()):
+    for iid in sorted(_all_recs.keys()):
         if iid in drop_set:
             continue
-        rec = table.records[iid]
-        # cluster_score in (0, 1) (sigmoid space).  'max' = best-view (avoids A'
-        # obj×sem_conf being diluted by the per-instance mean over bad-view frames).
+        rec = _all_recs[iid]
         score_ids.append(int(iid))
-        score_vals.append(float(rec.max_objectness if objectness_agg == 'max'
-                                else rec.mean_objectness))
+        score_vals.append(_record_cluster_score(rec, objectness_agg, _pq_rank))
 
     np.savez_compressed(save_file,
         centers       = centers_np.astype(np.float32),
@@ -614,6 +652,8 @@ def dump_instance_labels_per_point_npz(
     transformation: Optional[torch.Tensor] = None,    # [4, 4] local→final (same as voxel dump)
     dropped_ids:    Optional[Set[int]]      = None,
     verbose:        bool                    = False,
+    objectness_agg: str                     = 'mean',  # same semantics as voxel dump
+    pq_rank:        bool                    = False,
 ) -> dict:
     """Per-point version of `dump_instance_labels_npz` — same NPZ schema but
     `centers` are the actual 3D points (typically post-conf-filter geo pts)
@@ -666,7 +706,7 @@ def dump_instance_labels_per_point_npz(
             continue
         rec = table.records[iid]
         score_ids.append(int(iid))
-        score_vals.append(float(rec.mean_objectness))
+        score_vals.append(_record_cluster_score(rec, objectness_agg, pq_rank))
 
     np.savez_compressed(save_file,
         centers       = pts_world.astype(np.float32),
@@ -691,6 +731,7 @@ def dump_instance_sem_queries_npz(
     save_file:      str,
     dropped_ids:    Optional[Set[int]] = None,
     verbose:        bool               = False,
+    extra_table                        = None,       # E4 stuff table (ids disjoint)
 ) -> dict:
     """Dump per-instance aggregated semantic features (`sem_query`) → NPZ.
 
@@ -711,12 +752,15 @@ def dump_instance_sem_queries_npz(
         voxel_size:  scalar float32   for reference (matches voxel NPZ).
     """
     table = memory.instance_table
+    _recs = dict(table.records)
+    if extra_table is not None:
+        _recs.update(extra_table.records)
     drop_set = dropped_ids or set()
     ids, feats = [], []
-    for iid in sorted(table.records.keys()):
+    for iid in sorted(_recs.keys()):
         if iid in drop_set:
             continue
-        rec = table.records[iid]
+        rec = _recs[iid]
         if rec.sem_query is None:
             continue
         ids.append(int(iid))

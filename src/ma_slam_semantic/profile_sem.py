@@ -131,7 +131,8 @@ def main():
         STATS["TOTAL forward_chunk"].append((time.perf_counter() - t0, 0, 0))
 
         t0 = time.perf_counter()
-        props, pix_map, pts_hd = make_proposals(out, chunk, cfg)
+        props, pix_map, pts_hd = make_proposals(out, chunk, cfg,
+                                                sem_backbone=sem.semantic_backbone)
         STATS["make_proposals (CPU)"].append((time.perf_counter() - t0, 0, 0))
 
         for t_i, key in enumerate(chunk["frame_keys"]):

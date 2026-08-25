@@ -150,9 +150,11 @@ def build_seed_queries(
     fastsam_seg, region_pool, patch_size: int, max_regions: int,
     images_01: torch.Tensor,            # [B, T, 3, H, W] in [0, 1]
     ins_tokens_list,                    # causal patch tokens (instance slice)
-    sem_feat: torch.Tensor,             # [B, T, sem_dim, H, W]
+    sem_feat: torch.Tensor,             # [B, T, sem_dim, H, W] (dense seeding)
     world_points: torch.Tensor,         # [B, T, H, W, 3]
     patch_start_idx: int,
+    sem_backbone=None,                  # TextRegion seeding: the frozen teacher
+    shared: dict = None,                # TextRegion seeding: cached shared_v_forward
 ):
     """FastSAM region → geo-aware-pooled seed queries (patch resolution).
 
@@ -176,13 +178,42 @@ def build_seed_queries(
     causal = ins_tokens_list[-1][:, :, patch_start_idx:]                    # [B,T,Npatch,Cf]
     causal = causal.reshape(BT, ph * pw, causal.shape[-1])
 
-    sem = sem_feat.detach().reshape(BT, sem_feat.shape[2], H, W)
-    sem = _safe_adaptive_avg_pool2d(sem, (ph, pw)).flatten(2).permute(0, 2, 1)  # [BT,Npatch,sem]
+    sem_regions = None
+    if sem_backbone is not None and shared is not None:
+        # ── TextRegion seeding ──
+        # The dense head's output is the STUDENT of exactly this teacher, so
+        # pooling TextRegion straight off the cached V skips the student and
+        # gives the seed the same mask-aware, bleed-free vector the instance
+        # semantics are later read out with.  It also removes the last consumer
+        # of the dense semantic head, which can then be dropped entirely.
+        with torch.no_grad():
+            onehot = F.one_hot(region_patch.clamp(min=0),
+                               num_classes=max_regions).to(torch.float32)
+            onehot = onehot * (region_patch >= 0).unsqueeze(-1).to(onehot.dtype)
+            onehot = onehot.permute(0, 2, 1)                    # [BT, Mmax, Npatch]
+            # The teacher pre-resizes its input, so its patch grid is NOT the
+            # model's (e.g. 32x32 vs 24x37).  Resample the region masks onto the
+            # teacher grid before pooling its V.
+            th, tw = shared['patch_h'], shared['patch_w']
+            if (th, tw) != (ph, pw):
+                onehot = F.interpolate(onehot.reshape(BT, max_regions, ph, pw),
+                                       (th, tw), mode='bilinear',
+                                       align_corners=False).clamp(min=0)
+                onehot = onehot.reshape(BT, max_regions, th * tw)
+            sem_regions = torch.stack([
+                sem_backbone.textregion_from_shared(shared, onehot[i], frame_idx=i)
+                for i in range(BT)
+            ])                                                  # [BT, Mmax, sem_dim]
+        sem = causal.new_zeros((BT, ph * pw, sem_regions.shape[-1]))
+    else:
+        sem = sem_feat.detach().reshape(BT, sem_feat.shape[2], H, W)
+        sem = _safe_adaptive_avg_pool2d(sem, (ph, pw)).flatten(2).permute(0, 2, 1)
 
     wp = world_points.reshape(BT, H, W, 3).permute(0, 3, 1, 2)
     wp = _safe_adaptive_avg_pool2d(wp, (ph, pw)).flatten(2).permute(0, 2, 1)    # [BT,Npatch,3]
 
-    seed, _ = region_pool(causal, sem, wp, region_patch, max_regions)       # [BT,Mmax,d_model]
+    seed, _ = region_pool(causal, sem, wp, region_patch, max_regions,
+                          sem_regions=sem_regions)                       # [BT,Mmax,d_model]
     seed = seed.reshape(B, T, max_regions, seed.shape[-1])
     return seed, region_id, region_conf
 

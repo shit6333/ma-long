@@ -20,6 +20,31 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
+def textregion_regions(
+    v: torch.Tensor,                # [num_heads, N_patch, head_dim]  V (no special tokens)
+    masks_low: torch.Tensor,        # [N, N_patch]  per-region weights at the patch grid (soft or hard)
+    shared: dict,                   # post-attention modules from _v_forward
+) -> torch.Tensor:
+    """Batched mask-weighted V pool → per-region text-aligned features [N, output_dim].
+
+    This is the core of `textregion_supervision_per_frame` without the dense
+    broadcast — usable for BOTH the per-query base (soft masks) and the
+    per-GT-instance target (hard one-hot), from the SAME cached V.  The math is
+    byte-identical to per_frame (weighted-sum `masks_low @ v_flat` → post-attn),
+    so a GT-mask call reproduces the legacy textregion target exactly.
+    """
+    num_heads, N_patch, head_dim = v.shape
+    v_flat = v.permute(1, 0, 2).reshape(N_patch, num_heads * head_dim)   # [N_patch, D]
+    region_v = (masks_low @ v_flat).unsqueeze(0)                          # [1, N, D]
+    out = shared['attn_out_proj'](region_v)
+    out = shared['ls1'](out)
+    out = out + shared['ls2'](shared['mlp'](shared['mlp_norm'](out)))
+    out = shared['final_norm'](out)
+    if shared.get('final_proj', None) is not None:
+        out = out @ shared['final_proj']                                 # [1, N, output_dim]
+    return out.squeeze(0)                                                 # [N, output_dim]
+
+
 def textregion_supervision_per_frame(
     v: torch.Tensor,                # [num_heads, N_patch, head_dim]  V (no special tokens)
     instance_mask: torch.Tensor,    # [H, W]  long, instance IDs (0=unlabeled)
@@ -45,15 +70,18 @@ def textregion_supervision_per_frame(
     if num_inst == 0:
         return torch.zeros(output_dim, H, W, device=device, dtype=dtype)
 
-    # One-hot: [num_inst, H, W]
-    mask_oh = (instance_mask.unsqueeze(0) == ids.view(-1, 1, 1)).to(dtype)
-
-    # Downsample to patch grid → [num_inst, N_patch]
-    mask_low = F.interpolate(
-        mask_oh.unsqueeze(0), (patch_h, patch_w),
-        mode='bilinear', align_corners=False,
-    ).squeeze(0).reshape(num_inst, patch_h * patch_w)
-    mask_low = mask_low.clamp(0, 1)
+    # Downsample one-hot to patch grid in CHUNKS: a full [num_inst, H, W]
+    # one-hot hits ~90 GB on frames with thousands of raw instance ids
+    # (ASE/Infinigen) — killed epoch-18 val twice (2026-07-29).
+    _rows = []
+    for _c0 in range(0, num_inst, 128):
+        _chunk = ids[_c0:_c0 + 128]
+        _oh = (instance_mask.unsqueeze(0) == _chunk.view(-1, 1, 1)).to(dtype)
+        _rows.append(F.interpolate(
+            _oh.unsqueeze(0), (patch_h, patch_w),
+            mode='bilinear', align_corners=False,
+        ).squeeze(0).reshape(_chunk.numel(), patch_h * patch_w))
+    mask_low = torch.cat(_rows, 0).clamp(0, 1)
 
     # Drop instances that lost all coverage at low res.
     keep = mask_low.sum(dim=-1) > 0
@@ -61,7 +89,6 @@ def textregion_supervision_per_frame(
         return torch.zeros(output_dim, H, W, device=device, dtype=dtype)
     mask_low = mask_low[keep]
     ids      = ids[keep]
-    mask_oh  = mask_oh[keep]
     num_inst = ids.numel()
 
     # Flatten V: [num_heads, N_patch, head_dim] → [N_patch, embed_dim]
@@ -83,6 +110,12 @@ def textregion_supervision_per_frame(
         out = out @ shared['final_proj']                            # [1, num_inst, output_dim]
     out = out.squeeze(0)                                            # [num_inst, output_dim]
 
-    # Broadcast back to dense [output_dim, H, W]
-    dense = torch.einsum('id,ihw->dhw', out, mask_oh)
-    return dense
+    # Broadcast back to dense [output_dim, H, W] via per-pixel gather —
+    # instance_mask is a label map (masks exclusive), no [n,H,W] one-hot.
+    dense = torch.zeros(output_dim, H * W, device=device, dtype=dtype)
+    inst_flat = instance_mask.reshape(-1)
+    iidx = torch.searchsorted(ids, inst_flat.clamp_min(ids.min()))
+    iidx = iidx.clamp_max(num_inst - 1)
+    sel = ids[iidx] == inst_flat
+    dense[:, sel] = out[iidx[sel]].T.to(dtype)
+    return dense.reshape(output_dim, H, W)

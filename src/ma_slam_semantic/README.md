@@ -2,9 +2,22 @@
 
 OpenSe3r 的 query-instance 語意建圖（DINOv2+TIPSv2-L14 雙 encoder → 12-block causal
 transformer with KV-cache → Mask2Former query head，FastSAM 外部 query seeding）移植到
-ma_slam 線上 SLAM 幾何上。參考凍結設定 = OpenSe3r `005_..._geo_default_conf032_gt` run
-（`config.FROZEN_MODEL_ARGS` 逐字保存）。完整計畫與 gate 紀錄見
+ma_slam 線上 SLAM 幾何上。參考設定 = OpenSe3r `005_..._geo_default_conf032_gt` run
+（pipeline 旋鈕在 `config.SemConfig`;模型架構由 checkpoint 自述）。完整計畫與 gate 紀錄見
 [docs/semantic_branch_plan.md](../../docs/semantic_branch_plan.md)。
+
+> **模型換代(2026-08-25)— 完成並通過驗收**(golden 零回歸;SceneNN-12 `semconf_pq`
+> p_top25q 29.65/49.56/67.14,同 cluster obj 27.92/46.35/62.12;A1 smoke 005 27.55/43.56/60.65)。 架構不再寫死在 config
+> (`FROZEN_MODEL_ARGS` 已刪除):`sem_model.build_model_from_ckpt` 從 checkpoint 自帶的
+> args 建模、再用權重校正(`vendor/semantic_mapping/model.py::_infer_arch_from_weights`
+> —— descfix ckpt 的 args 寫 descriptor MLP=0 但檔案有 3 層;`pq_head` 有無同理),
+> trainable key 有任何 missing/unexpected 直接 raise。`--ckpt {semconf|semconf_pq|a1|path}`
+> 切換模型(預設 `semconf_pq`);`--ranker p_top25q`(P/Q 排序,無 P/Q head 自動退回
+> objectness 並在 export 印警告);`--sem_agg auto`(A1 無 dense head → 走 frozen-TIPS
+> textregion pool)。細節與坑見 **[docs/opense3r_model_handoff.md](../../docs/opense3r_model_handoff.md)**。
+> vendor/ 已同步 live repo 的 12 個檔案 + 新增 `opense3r/pq_head.py`(注意:H2O KV 的
+> `stac_kv/` + `causal_branch.register_kv_mgr` + `init_kv_cache` 的 `reset_kv_mgr()` 是
+> ma-slam 本地 patch,live repo 沒有 —— 之後 re-vendor 時要保留)。
 
 ## 架構
 
