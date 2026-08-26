@@ -7,3 +7,7 @@ ma_slam geometry through the S1 hooks. See docs/semantic_branch_plan.md.
 Phase-1 imports OpenSe3r code via ``SemConfig.opense3r_root`` (sys.path); nothing from
 OpenSe3r is vendored here.
 """
+
+import os as _os
+# see config.py — sm_120 cuBLAS split-K workspace overflow in the P/Q pooling GEMMs
+_os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")

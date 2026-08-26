@@ -91,6 +91,7 @@ class BiDescConfig:
                                  # Real loops come in clusters, so losing a thin-
                                  # evidence member is cheap (redundancy).
     s2_min_m_rot: int = 4        # below this, rotation/translation metrics abstain
+    s2_enable: bool = True       # ablation: False = S1-only (no layout graph verdict)
 
     # Debug: when set, verify_loop_candidate dumps one JSON per candidate here
     # (both frames' full node lists with camera-frame XYZ, the MNN pairs, per-frame

@@ -51,6 +51,11 @@ class SemanticHooks:
         self.frame_index = FrameIndex(k_bag=self.lc_cfg.k_bag,
                                       keep_desc=(self.lc_cfg.desc_src == "proposal"))
         self._dump_n = 0        # candidate counter for lc_cfg.dump_dir file naming
+        # incremental reconstruction snapshots (cfg.snapshot_dir) -> video offline
+        self.snap = None
+        if getattr(cfg, "snapshot_dir", ""):
+            from ma_slam_semantic.snapshots import SnapshotWriter
+            self.snap = SnapshotWriter(cfg.snapshot_dir, conf_coef=cfg.conf_gate_coef)
 
     # ------------------------------------------------------------------ hooks
     def on_submap(self, sm, gmap, graph) -> None:
@@ -107,6 +112,10 @@ class SemanticHooks:
                 print(f"[sem_hooks]   h2o-kv: tokens/layer={info['kvcache_size'][0]}"
                       f"  used={info['kvcache_used_mb']:.0f}MB"
                       f"  prune={self.model.policy.prune_ms:.1f}ms")
+        if self.snap is not None:
+            self.snap.write_step(gmap, graph, table=self.table,
+                                 loop_events=self.loop_events,
+                                 voxel_size=self.cfg.voxel_size, n_frames=self.n_frames)
 
     def verify_loop_candidate(self, q_path: str, m_path: str):
         """Bi-Desc verdict for a SALAD loop candidate (solver-initiated; read-only).
@@ -153,7 +162,7 @@ class SemanticHooks:
         # Stage 2 (shadow): layout graphs over the Stage-1 unique matches.
         C_q = self.frame_index.get_centers(q_path)
         C_r = self.frame_index.get_centers(m_path)
-        if C_q is not None and C_r is not None and v.pairs:
+        if self.lc_cfg.s2_enable and C_q is not None and C_r is not None and v.pairs:
             uniq = [(q_rows[p["q"]], r_rows[p["r"]]) for p in v.pairs if p["uniq"]]
             if uniq:
                 qi, ri = zip(*uniq)
@@ -215,6 +224,10 @@ class SemanticHooks:
     def on_finish(self, gmap, graph) -> None:
         if self.table is None:
             return
+        if self.snap is not None:          # final optimized map as the last frame
+            self.snap.write_step(gmap, graph, table=self.table,
+                                 loop_events=self.loop_events,
+                                 voxel_size=self.cfg.voxel_size, n_frames=self.n_frames)
         import numpy as np
         if len(self.frame_index):
             ns = np.array([len(v) for v in self.frame_index._ids.values()])

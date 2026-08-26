@@ -19,6 +19,18 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+# ---------------------------------------------------------------------------
+# cuBLAS workspace (sm_120 / Blackwell). torch's default per-handle workspace is too
+# small for the split-K fp32 SGEMMs of the P/Q head's mask-weighted pooling
+# (K = H*W = 174,048): cuBLAS then WRITES OUT OF BOUNDS (compute-sanitizer 2026-08-26,
+# 'Invalid __global__ write' in cutlass_80_simt_sgemm_*_align1), silently clobbering
+# neighbouring buffers — with DA3 co-resident that was its cached RoPE positions
+# ('Storage size calculation overflowed' at the next submap). ':4096:8' (8 x 4 MB)
+# makes the run complete with results identical to the P/Q-less checkpoint.
+# Must be set before the first CUDA matmul (torch caches the value at first use).
+# ---------------------------------------------------------------------------
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 # OpenSe3r code root resolution, in priority order:
 #   1. $OPENSE3R_ROOT env var (e.g. point at the live repo to compare against it)
 #   2. the self-contained vendored copy at <ma_long>/vendor (default — 帶著走)
@@ -188,6 +200,7 @@ class SemConfig:
 
     # debug
     save_2d_masks: bool = False
+    snapshot_dir: str = ""                       # per-submap reconstruction snapshots (video)
     mask_2d_top_k: int = 15
 
     @property

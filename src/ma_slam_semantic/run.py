@@ -134,7 +134,7 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     from ma_slam_semantic.bidesc_lc import BiDescConfig
     lc_cfg = BiDescConfig(n_min=a.bd_nmin, tau_pair=a.bd_pair, tau_dir=a.bd_dir,
                           tau_bi=a.bd_bi, n_uniq=a.bd_nuniq, k_bag=a.bd_kbag,
-                          desc_src=a.bd_desc_src,
+                          desc_src=a.bd_desc_src, s2_enable=(a.bd_s2 == "on"),
                           dump_dir=(os.path.join(a.out, "semlc_dump")
                                     if a.sem_lc_dump else ""))
     hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions,
@@ -209,6 +209,11 @@ def main():
                     help="S1 UNKNOWN handling: 'fail' = hard-reject (default; uniform "
                          "with M_LOW — no instance evidence, no edge), 'coloc' = fall "
                          "through to the normal coloc bar")
+    ap.add_argument("--snapshot", action="store_true",
+                    help="write per-submap reconstruction snapshots to <out>/snapshots "
+                         "(render with scripts/render_snapshots.py)")
+    ap.add_argument("--bd_s2", default="on", choices=["on", "off"],
+                    help="Stage-2 layout-graph verdict (off = S1-only ablation)")
     ap.add_argument("--sem_lc_dump", action="store_true",
                     help="dump per-candidate scene-graph JSONs to <out>/semlc_dump "
                          "(render with scripts/render_semlc_graph.py)")
@@ -259,7 +264,8 @@ def main():
                      h2o_recent_frames=a.h2o_recent, h2o_hh_frames=a.h2o_hh,
                      h2o_decay=a.h2o_decay, h2o_subsample=a.h2o_subsample)
 
-    model_kwargs = dict(ckpt=a.ckpt, ranker=a.ranker, sem_agg=a.sem_agg)
+    model_kwargs = dict(ckpt=a.ckpt, ranker=a.ranker, sem_agg=a.sem_agg,
+                        snapshot_dir=(os.path.join(a.out, "snapshots") if a.snapshot else ""))
     if a.geometry == "ma":
         cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef,
                         **kv_kwargs, **model_kwargs)

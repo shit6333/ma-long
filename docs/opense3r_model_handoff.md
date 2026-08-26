@@ -266,3 +266,56 @@ throughput ~7 fps(每幀多一次 frozen-TIPS forward)。
 `test_causal_branch.py` 7/7 通過;端到端 TUM fr1_xyz(`--kv_policy h2o`,新 loader,`semconf`)
 h2o-kv tokens/layer 固定 15096 / 708 MB / prune 3.7 ms,Sim3-ATE 0.0103 / SE3 0.0251 / loops=2
 與 re-vendor 前的 run(`outputs/sem_lc_shadow/unkfail_full/fr1_xyz`)逐位一致。
+
+### 8.2 ⚠️ 發現的真 bug:P/Q 池化 GEMM 在 sm_120 上越界寫入(cuBLAS workspace,2026-08-26)
+
+**症狀(ma-slam,`--geometry ma --backend da3 --ckpt semconf_pq`):** 第二個 submap 的 DA3 forward 死在
+RoPE `torch.arange(seq_len)`:`RuntimeError: Storage size calculation overflowed with sizes=[4.8e18]`,
+3/3 確定性重現。DA3 的 `PositionGetter` 把 position tensor 快取在 GPU 跨呼叫重用,`int(positions.max())+1`
+讀到垃圾 = 那塊 buffer 被別的 kernel 寫壞。`semconf`(無 P/Q head)同設定全程正常;snapshot / h2o / 幾何
+全長 bisect 排除。
+
+**定位:** `compute-sanitizer memcheck`(純語意 8 幀、無 DA3、無 h2o):`semconf` **0 errors**;
+`semconf_pq` 66× `Invalid __global__ write`,kernel = `cutlass_80_simt_sgemm_128x64_8x5_nn_align1`
+(cuBLAS fp32),寫到「20 MB 配置之外 549 KB」。`CUDA_LAUNCH_BLOCKING=1` 指到
+`instance_head_query_m2f.py` 的 `_semp = _w @ _sf.flatten(1).t()`(dense P/Q 語意池化,
+`[100, 174048] @ [174048, 1024]`),`pq_head.build_pq_inputs` 的 `pooled`(C=256)是同型。
+
+**排除的假設(都做過):** contiguous RHS(`sem_feat` 是 channels-last,`.t()` 本來就連續 → no-op);
+K 切塊累加(每個小 GEMM 照樣越界);相同運算元 dump 出來獨立 process 重播 **0 errors** → 不是資料/shape。
+
+**根因:torch 在 sm_120 給 cuBLAS 的預設 workspace 太小,split-K SGEMM 溢出 workspace。**
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`(8 × 4 MB)→ xyz 全長 semconf_pq + DA3 + h2o 跑完,ATE 0.0103
+與 semconf 逐位相同、P/Q 29/29。
+
+**修法:** `ma_slam_semantic/__init__.py` + `config.py` 在 import 時 `os.environ.setdefault(
+"CUBLAS_WORKSPACE_CONFIG", ":4096:8")`(torch 第一次建 cuBLAS handle 時讀取,之後固定)。
+`pq_head.pooled_matmul` 保留 PQ_POOL_MODE(chunk/bf16/fp64)與 PQ_DUMP 當診斷用,預設 plain。
+**驗證(修法後):** 單獨一個 `compute-sanitizer memcheck`(4 幀、chunk 2、`semconf_pq`)→ **0 invalid writes、0 errors**,run 正常 export;TUM 9 場 ×2 設定全長跑完(§8.3)。
+**建議 upstream 到 OpenSe3r**:GT 幾何模式沒有 DA3 當受害者所以「看起來」沒事,但越界寫入一樣發生
+——很可能就是那邊「stochastic CausalBranch NaN」的來源(訓練時也一樣)。診斷配方:
+`compute-sanitizer --tool memcheck`(一次只能跑一個,memcheck 會把 process 撐到 80 GB+)
++ `CUDA_LAUNCH_BLOCKING=1` 取精確行號。
+
+### 8.3 新模型的 sem-LC 實驗(TUM fr1 ×9,w32,DA3,h2o,`--ckpt semconf_pq`,2026-08-26)
+
+`outputs/sem_lc_shadow/newmodel_w32/{s1,s1s2}/fr1_*`,每場附 `semlc_dump/render/index.html`
+(sem-LC scene-graph gallery)與 `snapshots/recon.mp4`(重建過程影片)。Sim3-ATE(m):
+
+| scene | base | S1 舊 / **新** | S1+S2 舊 / **新** |
+|---|---|---|---|
+| 360 | 0.0953 | 0.0954 / 0.0942 | 0.0491 / 0.0502 |
+| desk | 0.0299 | 0.0298 / 0.0299 | 0.0298 / 0.0299 |
+| desk2 | 0.0231 | 0.0231 / 0.0231 | 0.0231 / 0.0231 |
+| floor | 0.1830 | 0.1452 / 0.1450 | 0.0689 / 0.0687 |
+| plant | 0.0401 | 0.0429 / 0.0429 | 0.0460 / 0.0460 |
+| room | 0.0428 | 0.0429 / 0.0428 | 0.0429 / 0.0428 |
+| rpy | 0.0253 | 0.0253 / 0.0253 | 0.0253 / 0.0253 |
+| teddy | 0.0516 | 0.0515 / 0.0503 | 0.0494 / 0.0491 |
+| xyz | 0.0103 | 0.0103 / 0.0103 | 0.0103 / 0.0103 |
+| **mean** | 0.0557 | 0.0518 / **0.0515** | 0.0383 / **0.0384** |
+
+新模型(semconf+PQ)與舊模型逐場一致(同一個凍結 trunk → descriptor / instance 中心相同 → LC
+決策相同;差異全在 forward 非確定性噪聲內),S1+S2 仍以 0.0384 勝 VGGT-SLAM 2.0 的 0.041。
+P/Q 在所有場景 100% 記錄。這組實驗是在 §8.2 的 cuBLAS workspace 修法之後跑的(修法前
+`semconf_pq` + DA3 第二個 submap 必崩)。

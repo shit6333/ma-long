@@ -90,6 +90,38 @@ class PQHead(nn.Module):
 
 
 @torch.no_grad()
+def pooled_matmul(w: torch.Tensor, X: torch.Tensor, k_chunk: int = 16384) -> torch.Tensor:
+    """``w @ X`` for the mask-weighted pooling GEMMs (w [N,K] fp32, X [K,C] fp32,
+    K = H*W ~ 1.7e5).
+
+    [ma-slam local, 2026-08-26] On sm_120 this fp32 SGEMM (cuBLAS split-K,
+    ``cutlass_80_simt_sgemm_*_align1``) WRITES OUT OF BOUNDS when torch's default
+    cuBLAS workspace is used (compute-sanitizer 'Invalid __global__ write'; DA3's
+    cached RoPE positions were the victim). The fix is process-level:
+    ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` (set by ma_slam_semantic at import). Neither a
+    contiguous RHS nor K-chunking avoids the kernel, so the default here is the plain
+    GEMM; PQ_POOL_MODE=chunk|bf16|fp64 remain as diagnostics, PQ_DUMP=<path.pt> saves
+    the first call's operands for offline replay.
+    """
+    import os
+    mode = os.environ.get("PQ_POOL_MODE", "plain")
+    dump = os.environ.get("PQ_DUMP")
+    if dump and not os.path.exists(dump):
+        torch.save({"w": w.detach().cpu(), "X": X.detach().cpu(),
+                    "w_stride": w.stride(), "X_stride": X.stride()}, dump)
+    if mode == "bf16":
+        return (w.to(torch.bfloat16) @ X.to(torch.bfloat16)).float()
+    if mode == "fp64":
+        return (w.double() @ X.double()).float()
+    if mode == "chunk" and w.shape[1] > k_chunk:
+        out = None
+        for k0 in range(0, w.shape[1], k_chunk):
+            part = w[:, k0:k0 + k_chunk] @ X[k0:k0 + k_chunk]
+            out = part if out is None else out + part
+        return out
+    return w @ X
+
+
 def build_pq_inputs(
     mask_logits: torch.Tensor,     # [N, H, W]  final-layer mask logits (one frame)
     F_mask:      torch.Tensor,     # [C, H, W]  pixel-decoder mask features
@@ -113,7 +145,7 @@ def build_pq_inputs(
 
     # pooled content vector (soft weights, full frame — cheap einsum)
     w = prob.flatten(1)                                           # [N, HW]
-    pooled = (w @ F_mask.flatten(1).t()) / w.sum(1, keepdim=True).clamp_min(1e-6)
+    pooled = pooled_matmul(w, F_mask.flatten(1).t()) / w.sum(1, keepdim=True).clamp_min(1e-6)
 
     # bboxes from hard mask, +15% margin, clamped
     ys = hard.any(2).float()                                       # [N, H]

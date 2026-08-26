@@ -56,6 +56,8 @@ Backward compatibility:
 """
 
 from __future__ import annotations
+
+import os
 from typing import Dict, List, Optional
 import math
 
@@ -1287,7 +1289,7 @@ class Mask2FormerQueryInstanceHead(nn.Module):
             # P/Q computed HERE (inside the possibly-checkpointed head) so only
             # [B,T,N] logits leave the boundary — the previous design exported
             # full-res F_mask through the checkpoint (prime NaN-trigger suspect).
-            from .pq_head import build_pq_inputs
+            from .pq_head import build_pq_inputs, pooled_matmul
             _dev_t = 'cuda' if queries.is_cuda else 'cpu'
             with torch.autocast(device_type=_dev_t, enabled=False):
                 qn_f = self.decoder_norm(queries).detach().float()        # [BT,N,D]
@@ -1334,7 +1336,8 @@ class Mask2FormerQueryInstanceHead(nn.Module):
                                                 size=_sf.shape[-2:], mode='bilinear',
                                                 align_corners=False)[:, 0]
                             _w = _pr.flatten(1)
-                            _semp = (_w @ _sf.flatten(1).t()) / _w.sum(1, keepdim=True).clamp_min(1e-6)
+                            # [ma-slam local fix] K-chunked GEMM — see pq_head.pooled_matmul
+                            _semp = pooled_matmul(_w, _sf.flatten(1).t()) / _w.sum(1, keepdim=True).clamp_min(1e-6)
                             _semp = F.normalize(_semp, dim=-1)
                     # bf16 for the pq_module call ONLY: the fp32 conv
                     # backward kernels here corrupt memory on this rig
