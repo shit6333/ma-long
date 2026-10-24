@@ -190,16 +190,17 @@ def main():
     ap.add_argument("--poll", type=float, default=0.05, help="[folder] poll interval (s)")
 
     ap.add_argument("--mode", default="rgb", choices=list(MODES))
-    ap.add_argument("--backend", default="ma", choices=["ma", "da3"],
+    ap.add_argument("--backend", default="da3", choices=["ma", "da3"],
                     help="backbone: 'ma' MapAnything | 'da3' DA3-nested (rgb/rgb+intr only)")
     ap.add_argument("--manifold", default="se3", choices=["se3", "sim3", "sl4"])
     ap.add_argument("--intrinsic",
                     help="K file; omit for 'local' (taken from the camera) or 'zmq' (META)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--submap_size", type=int, default=20)
+    ap.add_argument("--submap_size", type=int, default=32)
     # --keyframe_disparity is a producer-side selection flag (with --k), defined in add_capture_args.
     ap.add_argument("--no_loop", action="store_true")
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
+    ap.add_argument("--max_per_submap", type=int, default=DEFAULT_CONFIG["Loop"]["max_per_submap"])
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
     ap.add_argument("--loop_half_window", type=int, default=DEFAULT_CONFIG["Loop"]["half_window"])
     ap.add_argument("--rot_max_deg", type=float, default=DEFAULT_CONFIG["Loop"]["rot_max_deg"])
@@ -244,7 +245,7 @@ def main():
                     help="[h2o] query subsample for colsum scores (0.25 validated: "
                          "AP par with full scores, colsum cost ~gone)")
     # ── instance-LC (semantic-assisted loop candidates; needs --semantic) ──
-    sp.add_argument("--sem_lc", default="shadow", choices=["off", "shadow", "enforce", "veto"],
+    sp.add_argument("--sem_lc", default="veto", choices=["off", "shadow", "enforce", "veto"],
                     help="instance-bag gating of SALAD tier-B candidates: shadow = "
                          "log SEMLC verdicts only (default), enforce = gated tier-B "
                          "loops become real edges")
@@ -284,7 +285,7 @@ def main():
     cfg["submap_size"] = a.submap_size
     cfg["Graph"]["manifold"] = a.manifold
     cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold,
-                       coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window,
+                       max_per_submap=a.max_per_submap, coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window,
                        rot_max_deg=a.rot_max_deg)
     cfg["Loop"]["Instance"].update(
         enable=(a.semantic and a.sem_lc != "off"), shadow=(a.sem_lc not in ("enforce", "veto")),

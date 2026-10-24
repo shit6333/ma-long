@@ -34,7 +34,16 @@ class DINOv2(nn.Module):
         # (dino_salad.ckpt) loaded later into the VPRModel carries the backbone weights,
         # so pretrained DINOv2 weights are optional here. We pull the arch from torch.hub
         # (already cached — MapAnything uses the same dinov2) instead of a bundled source.
-        self.model = torch.hub.load('facebookresearch/dinov2', model_name, pretrained=False)
+        # Prefer the local hub cache: the remote call validates the repo against the GitHub
+        # API on every start and blocks indefinitely when GitHub is slow / rate-limited
+        # (two SLAM runs hung for an hour with a socket open to github.com).
+        import os
+        _local = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+        if os.path.isdir(_local):
+            self.model = torch.hub.load(_local, model_name, source="local", pretrained=False)
+        else:
+            self.model = torch.hub.load('facebookresearch/dinov2', model_name, pretrained=False,
+                                        skip_validation=True)
         if vggt_long_config is not None and vggt_long_config.get('Weights', {}).get('DNIO'):
             self.model.load_state_dict(torch.load(vggt_long_config['Weights']['DNIO']))
         self.num_channels = DINOV2_ARCHS[model_name]

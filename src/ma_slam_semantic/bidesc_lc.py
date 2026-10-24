@@ -84,6 +84,25 @@ class BiDescConfig:
                                  # 0.41); 1.0 dominates on the merged w20+w32 audit.
                                  # TODO general form: tnorm / median instance depth
                                  # (d_ref, now logged) — scale-free like coloc.
+    s2_tau_t_rel: float = 0.0    # >0: scale-free t gate, T_FAR if t_norm > rel*d_ref
+                                 # (d_ref = median history-side instance depth) —
+                                 # needed for non-metric backbones (VGGT plug-in) where
+                                 # the absolute s2_tau_t [m] has no meaning. Overrides
+                                 # s2_tau_t when set.
+    s2_t_noise_aware: bool = False  # T_FAR only if t_norm exceeds the gate by more than the
+                                 # translation uncertainty implied by the rotation residual,
+                                 # d_ref*sin(E_R): t* is computed with the estimated R, so a
+                                 # noisy R (few edges, large E_R) inflates |t*| by ~d_ref*sin(E_R)
+                                 # (50px 360 692<->91: M=4, E_R 22deg, d_ref 1.96 -> +0.73 m false alarm).
+    s2_lvc_first: bool = False   # check theta_R > s2_tau_theta_deg BEFORE the t/Ed/ER gates:
+                                 # a layout that says the two views are rotated >50deg cannot be
+                                 # co-visible whatever the edge residuals say (25px 360 416<->6:
+                                 # thR 90-161deg, otherwise only a soft FAIL that coloc 0.40 slips).
+    s2_lvc_first: bool = False   # check theta_R > s2_tau_theta_deg BEFORE T_FAR/Ed/ER: a layout
+                                 # that says the views are rotated >50deg cannot be co-visible,
+                                 # whatever the edge residuals say (25px 360 416<->6: theta_R
+                                 # 90-161deg across two runs, but E_R/t* noise let it fall to a
+                                 # soft FAIL that coloc 0.40 slipped under).
     s2_min_m: int = 3            # M<=2 -> M_LOW hard reject: 1-2 co-visible objects
                                  # cannot support ANY verdict (single-edge chance
                                  # consistency let w32 730<->233 through; M=1 has no
@@ -91,12 +110,28 @@ class BiDescConfig:
                                  # Real loops come in clusters, so losing a thin-
                                  # evidence member is cheap (redundancy).
     s2_min_m_rot: int = 4        # below this, rotation/translation metrics abstain
-    s2_enable: bool = True       # ablation: False = S1-only (no layout graph verdict)
+    s2_enable: bool = False      # layout graph verdict (dropped from the method; True = S1+S2 ablation)
 
     # Debug: when set, verify_loop_candidate dumps one JSON per candidate here
     # (both frames' full node lists with camera-frame XYZ, the MNN pairs, per-frame
     # K, and the S1+S2 verdicts) for scripts/render_semlc_graph.py.
     dump_dir: str = ""
+
+    # ---- 'rigid' mode: object-level rigid-consistency verifier (replaces S1+S2 when
+    # mode == 'rigid'; the old Bi-Desc/layout path is untouched under mode == 'bidesc').
+    #   1. match: mutual-NN instance pairs with descriptor cos >= rigid_tau
+    #   2. check: Kabsch over triplets of matched camera-frame centres; inlier iff
+    #      |R c_r + t - c_q| < rigid_eps_rel * d_ref (d_ref = median matched history depth)
+    #   3. verdict: max inliers >= rigid_min_inliers -> PASS else REJECT (3 points define the
+    #      pose, the 4th verifies it; with exactly 3 pairs a congruent triangle is chance-level)
+    # rigid_lowobj: when either frame has < rigid_min_inliers instances there is no evidence:
+    #   'reject' (positive evidence required) | 'coloc' (hand the candidate to the geometric check)
+    mode: str = "rigid"          # shipped method (IDLV); "bidesc" = old S1/S2 rules
+    rigid_tau: float = 0.85
+    rigid_eps_rel: float = 0.15
+    rigid_min_inliers: int = 4
+    rigid_lowobj: str = "reject"
+    rigid_geom: bool = False     # shipped: PASS iff >= rigid_min_inliers MNN pairs (no layout); True = triplet-Kabsch layout ablation
 
 
 def adaptive_k(n: int, cfg: BiDescConfig) -> int:
@@ -141,6 +176,21 @@ class FrameIndex:
                                  if order else np.zeros((0, 3), np.float32))
         if K is not None:
             self._K[path] = np.asarray(K, np.float32)
+
+    def add_lc(self, path: str, descs, centers) -> None:
+        """Transient loop-verification bag for a frame (all detector proposals, top-k_bag by
+        objectness): L2-normalised descriptors + camera-frame centres. Not map instances."""
+        if not hasattr(self, "_lc"):
+            self._lc = {}
+        if len(descs) == 0:
+            self._lc[path] = (np.zeros((0, 256), np.float32), np.zeros((0, 3), np.float32))
+            return
+        D = np.stack([np.asarray(d, np.float32) for d in descs])
+        D /= (np.linalg.norm(D, axis=1, keepdims=True) + 1e-12)
+        self._lc[path] = (D, np.stack([np.asarray(c, np.float32) for c in centers]))
+
+    def get_lc(self, path: str):
+        return getattr(self, "_lc", {}).get(path)
 
     def get(self, path: str) -> Optional[List[Tuple[int, float]]]:
         return self._ids.get(path)
@@ -223,6 +273,20 @@ class LayoutVerdict:
                 + (f" ({self.reason})" if self.reason else ""))
 
 
+def _t_far(v, cfg: BiDescConfig, d_ref: float, e_r: float) -> bool:
+    """Translation gate: absolute (s2_tau_t) or relative (s2_tau_t_rel * d_ref); with
+    s2_t_noise_aware the gate is widened by d_ref*sin(E_R) (rotation-induced t* noise)."""
+    if cfg.s2_tau_t_rel and d_ref > 0:
+        gate = cfg.s2_tau_t_rel * d_ref
+    elif cfg.s2_tau_t:
+        gate = cfg.s2_tau_t
+    else:
+        return False
+    if cfg.s2_t_noise_aware:
+        gate += d_ref * float(np.sin(np.radians(min(e_r, 90.0))))
+    return v.t_norm > gate
+
+
 def verify_layout(P_q: np.ndarray, P_r: np.ndarray, cfg: BiDescConfig) -> LayoutVerdict:
     """Doc-faithful Stage 2: nodes = Stage-1-matched instances' CAMERA-frame 3D
     positions (both sides observed in their own frame -> drift-free); edges =
@@ -288,7 +352,12 @@ def verify_layout(P_q: np.ndarray, P_r: np.ndarray, cfg: BiDescConfig) -> Layout
         # rotation/translation unobservable -> distance-only ruling
         v.status = "PASS" if e_d <= cfg.s2_tau_d else "FAIL"
         v.reason = "rot-abstain" if v.status == "PASS" else "Ed(rot-abstain)"
-    elif cfg.s2_tau_t and v.t_norm > cfg.s2_tau_t:
+    elif cfg.s2_lvc_first and theta_r > cfg.s2_tau_theta_deg:
+        v.status = "LARGE_VIEW_CHANGE"
+    elif cfg.s2_lvc_first and theta_r > cfg.s2_tau_theta_deg:
+        v.status = "LARGE_VIEW_CHANGE"
+        v.reason = "thetaR(first)"
+    elif _t_far(v, cfg, d_ref, e_r):
         v.status = "T_FAR"        # cameras too far apart per instance evidence
     elif e_d <= cfg.s2_tau_d and e_r <= cfg.s2_tau_r_deg:
         v.status = "PASS" if theta_r <= cfg.s2_tau_theta_deg else "LARGE_VIEW_CHANGE"
@@ -343,4 +412,95 @@ def verify(D_q: np.ndarray, D_r: np.ndarray, cfg: BiDescConfig) -> BiDescVerdict
         if a_bi <= cfg.tau_bi:
             why.append("bi")
         v.reason = "+".join(why)
+    return v
+
+
+# ------------------------------------------------------------------ rigid-consistency verifier
+@dataclass
+class RigidVerdict:
+    """Object-level rigid-consistency verdict (cfg.mode == 'rigid')."""
+    status: str                     # 'PASS' | 'REJECT' | 'UNKNOWN' (low-object, coloc fallback)
+    n_q: int = 0
+    n_r: int = 0
+    n_pairs: int = 0                # MNN pairs with cos >= rigid_tau
+    inliers: int = 0                # best triplet hypothesis inlier count
+    eps: float = 0.0
+    d_ref: float = 0.0
+    reason: str = ""
+    pairs: list = field(default_factory=list)
+    R: object = None
+    t: object = None
+    rigid: bool = True
+    layout: object = None
+    # BiDescVerdict-compatible fields (dump / renderer)
+    a_qr: float = 0.0
+    a_rq: float = 0.0
+    a_bi: float = 0.0
+    n_uniq: int = 0
+
+    def summary(self) -> str:
+        return (f"{self.status} pairs={self.n_pairs} inliers={self.inliers} eps={self.eps:.2f} "
+                f"dref={self.d_ref:.2f} nq/nr={self.n_q}/{self.n_r}"
+                + (f" ({self.reason})" if self.reason else ""))
+
+    def pairs_str(self) -> str:
+        return " ".join(f"q{p['q']}~r{p['r']}:s{p['sim']:.2f}"
+                        f":{'IN' if p['uniq'] else 'out'}" for p in self.pairs)
+
+
+def _kabsch(P: np.ndarray, Q: np.ndarray):
+    mp, mq = P.mean(0), Q.mean(0)
+    H = (P - mp).T @ (Q - mq)
+    U, _, Vt = np.linalg.svd(H)
+    D = np.diag([1.0, 1.0, float(np.sign(np.linalg.det(Vt.T @ U.T)))])
+    R = Vt.T @ D @ U.T
+    return R, mq - R @ mp
+
+
+def verify_rigid(D_q: np.ndarray, D_r: np.ndarray, C_q: np.ndarray, C_r: np.ndarray,
+                 cfg: BiDescConfig) -> RigidVerdict:
+    """Match instances by descriptor (MNN, cos >= rigid_tau), then count how many matched
+    camera-frame centres agree with one rigid transform (exhaustive triplet Kabsch)."""
+    import itertools
+    n_q, n_r = len(D_q), len(D_r)
+    m = int(cfg.rigid_min_inliers)
+    if min(n_q, n_r) < m:
+        st = "UNKNOWN" if cfg.rigid_lowobj == "coloc" else "REJECT"
+        return RigidVerdict(st, n_q=n_q, n_r=n_r, reason=f"lowobj min(nq,nr)<{m}")
+    S = D_q @ D_r.T
+    row_arg, col_arg = S.argmax(axis=1), S.argmax(axis=0)
+    pairs = []
+    for i in range(n_q):
+        j = int(row_arg[i])
+        if int(col_arg[j]) == i:
+            pairs.append(dict(q=i, r=j, sim=float(S[i, j]), uniq=bool(S[i, j] >= cfg.rigid_tau)))
+    good = [p for p in pairs if p["uniq"]]
+    v = RigidVerdict("REJECT", n_q=n_q, n_r=n_r, n_pairs=len(good), pairs=pairs,
+                     n_uniq=len(good))
+    if len(good) < m:
+        v.reason = f"pairs<{m}"
+        return v
+    if not cfg.rigid_geom:                       # matching-only ablation (B-S1)
+        v.inliers = len(good); v.status = "PASS"
+        return v
+    Cq = np.asarray([C_q[p["q"]] for p in good], np.float64)
+    Cr = np.asarray([C_r[p["r"]] for p in good], np.float64)
+    v.d_ref = float(np.median(np.linalg.norm(Cr, axis=1)))
+    v.eps = float(cfg.rigid_eps_rel * max(v.d_ref, 1e-6))
+    best, best_rt, best_in = 0, None, None
+    for tri in itertools.combinations(range(len(good)), 3):
+        R, t = _kabsch(Cr[list(tri)], Cq[list(tri)])
+        res = np.linalg.norm((Cr @ R.T + t) - Cq, axis=1)
+        inl = res < v.eps
+        k = int(inl.sum())
+        if k > best:
+            best, best_rt, best_in = k, (R, t), inl
+    v.inliers = best
+    if best_rt is not None:
+        v.R, v.t = best_rt
+        for p, ok in zip(good, best_in):
+            p["uniq"] = bool(ok)          # renderer: filled = geometric inlier
+    v.status = "PASS" if best >= m else "REJECT"
+    if v.status == "REJECT":
+        v.reason = f"inliers<{m}"
     return v

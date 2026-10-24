@@ -137,8 +137,13 @@ def split_chunk(chunk: Dict, size: int) -> Iterator[Dict]:
     if T <= size:
         yield chunk
         return
-    for s in range(0, T, size):
-        e = min(s + size, T)
+    bounds = [(s, min(s + size, T)) for s in range(0, T, size)]
+    if len(bounds) > 1 and (bounds[-1][1] - bounds[-1][0]) < max(2, size // 2):
+        # a 1-frame trailing chunk (33 = 8x4 + 1) gives the model no multi-frame context and
+        # the submap's last frame — shared with the next submap — ends up with few/zero
+        # proposals; fold it into the previous chunk instead (4,4,...,4,5).
+        bounds[-2] = (bounds[-2][0], bounds[-1][1]); bounds.pop()
+    for s, e in bounds:
         sub = {}
         for k, v in chunk.items():
             if torch.is_tensor(v):

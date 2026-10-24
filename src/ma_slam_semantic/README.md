@@ -6,6 +6,9 @@ ma_slam 線上 SLAM 幾何上。參考設定 = OpenSe3r `005_..._geo_default_con
 （pipeline 旋鈕在 `config.SemConfig`;模型架構由 checkpoint 自述）。完整計畫與 gate 紀錄見
 [docs/semantic_branch_plan.md](../../docs/semantic_branch_plan.md)。
 
+> **2026-08-28:預設 checkpoint 切為 `a1_pq`(A1 ep28 + P/Q ep14,handoff §6 出貨檔)** ——
+> ma-slam 驗收 SceneNN-12 32.37/55.10/68.68(文件 32.35/53.71/68.30)、TUM S1+S2 0.0380(semconf_pq 0.0384)。
+> `--ckpt semconf_pq` 可切回舊模型。
 > **模型換代(2026-08-25)— 完成並通過驗收**(golden 零回歸;SceneNN-12 `semconf_pq`
 > p_top25q 29.65/49.56/67.14,同 cluster obj 27.92/46.35/62.12;A1 smoke 005 27.55/43.56/60.65)。 架構不再寫死在 config
 > (`FROZEN_MODEL_ARGS` 已刪除):`sem_model.build_model_from_ckpt` 從 checkpoint 自帶的
@@ -70,10 +73,12 @@ PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.run --geometry 
     --data /mnt/HDD4/ricky/data/instance_eval_data/scenenn/oni/005 \
     --demo_type scenenn_gt --out outputs/ma_sem/005_golden [--save_2d_masks]
 
-# ma_slam 幾何模式（完整線上 SLAM + 語意）
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.run --geometry ma \
-    --data data/scene0231_00 --mode rgb+depth+intr --submap_size 20 \
-    --out outputs/ma_sem/s0231_ma --gt data/scene0231_00/gt_pose.txt
+# ma_slam 幾何模式（完整線上 SLAM + 語意）— 預設值 = 最新 Ident3R-SLAM 設定（2026-10-22），不需額外旗標：
+#   --geometry ma --backend da3 --mode rgb --submap_size 32 --keyframe_disparity 50
+#   SALAD 0.40 / top-5 per submap、--sem_lc veto --sem_lc_mode rigid --rigid_geom off（IDLV：只看 MNN 配對數，
+#   cos>=0.85、>=4 對）--lc_proposal_conf prefer --lc_history bag、--kv_policy h2o (8/8, subsample 0.25)
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.run \
+    --data data/tum/fr1_room_dist --out outputs/ma_sem/fr1_room --gt data/tum/fr1_room_dist/gt_pose.txt
 
 # 效能剖析（各模組時間 + VRAM + KV 成長）
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.profile_sem --max_frames 64
@@ -101,8 +106,10 @@ python -m ma_slam_semantic.deploy --dir outputs/ma_sem/<scene> --name <scene>
 |---|---|---|
 | `--conf_gate_coef` | 1.0 | 幾何 validity gate（× submap 平均 conf）。**實務 inference 留 1.0**（擋不準的 pred geo）；**benchmark 報表用 0.5**（GT-mesh 覆蓋率計分下 5-scene mean AP 20.8→25.3）。效果 scene-specific：幾何乾淨的場景放鬆只會進雜訊。 |
 | `chunk_size` / `--sem_chunk_size` | 4 | 每次 causal forward 幀數，**純 VRAM 旋鈕**（結果不變）：4≈15GB、8≈26GB 峰值 |
-| `--kv_policy` | 離線 `none` / 串流 `h2o` | flat KV 成長 62MB/幀（1000 幀=61GB）；`h2o`（STAC：pinned frame0 + `--h2o_recent` 8 + heavy-hitter `--h2o_hh` 8、`--h2o_subsample 0.25` 已驗證 AP 持平）恆定 ~0.7GB |
+| `--kv_policy` | `h2o`（離線、串流皆同；`none` = flat KV 對照） | flat KV 成長 62MB/幀（1000 幀=61GB）；`h2o`（STAC：pinned frame0 + `--h2o_recent` 8 + heavy-hitter `--h2o_hh` 8、`--h2o_subsample 0.25` 已驗證 AP 持平）恆定 ~0.7GB |
 | `--no_loop` | off | LC 開著 instance map 會自癒（s0231：213 vs 240 instances） |
+| `--sem_lc` / `--sem_lc_mode` / `--rigid_geom` | `veto` / `rigid` / `off` | IDLV（論文方法）：SALAD 候選需 >=4 個 MNN instance 配對（cos>=0.85）才進幾何驗證，否則 REJECT。`bidesc`（舊 S1/S2 規則）、`--rigid_geom on`（layout）、`--bd_s2 on` 皆為 ablation |
+| `--sim_threshold` / `--max_per_submap` | 0.40 / 5（solver 預設） | relaxed 檢索 = 最新主表設定；0.50 / 1 = strict 對照 |
 
 ### ScanNet 5-scene benchmark（inst SN200 + instsem）
 

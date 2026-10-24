@@ -79,23 +79,28 @@ def ensure_opense3r(root: str = None) -> str:
 #   semconf_pq  + P/Q ranking head on the SAME trunk (paper numbers; descfix ckpt:
 #               its stored args say query_descriptor_mlp_layers=0 but the file
 #               carries 3 layers -> arch must be inferred from the WEIGHTS)
-#   a1          textregion seeding, dense semantic head REMOVED (semantic_feat is
-#               None -> proposals pool frozen-TIPS textregion instead); training
-#               until ~2026-08-28, P/Q head to be added afterwards
+#   a1          A1 trunk ep28 WITHOUT P/Q (textregion seeding, dense semantic head
+#               REMOVED -> semantic_feat is None -> proposals pool frozen-TIPS
+#               textregion). ep28 on purpose: ep40 regressed (handoff §6.3).
+#   a1_pq       A1 ep28 + P/Q head trained on it (pq ep14, pq_sem_source=textregion)
+#               — the 2026-08-28 shipping checkpoint (handoff §6: first model to win
+#               all six OVO cells; SceneNN-12 32.35/53.71/68.30)
 # ---------------------------------------------------------------------------
 CKPTS = {
     "vendor": dict(
         semconf=os.path.join(VENDOR_ROOT, "weights/opense3r_fastsam_query_semconf.pth"),
         semconf_pq=os.path.join(VENDOR_ROOT, "weights/opense3r_semconf_pq_descfix.pth"),
         a1=os.path.join(VENDOR_ROOT, "weights/opense3r_a1.pth"),
+        a1_pq=os.path.join(VENDOR_ROOT, "weights/opense3r_a1ep28_pq_ep14.pth"),
     ),
     "live": dict(
         semconf="{root}/outputs/opense3r_fastsam_query_semconf/checkpoint-last.pth",
         semconf_pq="{root}/outputs/opense3r_pq_only_on_semconf/checkpoint-last-descfix.pth",
-        a1="{root}/outputs/opense3r_fastsam_query_a1/checkpoint-last.pth",
+        a1="{root}/outputs/opense3r_fastsam_query_a1/checkpoint-ep28.pth",
+        a1_pq="{root}/outputs/opense3r_pq_only_on_a1ep28/checkpoint-pq-ep14.pth",
     ),
 }
-DEFAULT_CKPT = "semconf_pq"
+DEFAULT_CKPT = "a1_pq"        # 2026-08-28 shipping ckpt (handoff §6); semconf_pq = previous
 
 
 def resolve_ckpt(name_or_path: str, root: str = None) -> str:
@@ -156,20 +161,48 @@ class SemConfig:
     # scaled by conf_gate_coef (1.0 = the ma_slam export default; LOWER keeps more
     # points => more GT coverage at eval, at the cost of noisier voxels).
     point_conf_threshold: float = 0.32
+    # 'gate'   : a proposal may only own geometry-valid pixels (conf >= point_conf_threshold);
+    #            proposals whose pixels are all invalid disappear (measured: ~40-55% of NMS
+    #            survivors on DA3, correlated with the per-submap mean-conf validity mask).
+    # 'prefer' : ownership is decided on all finite pixels (the detector saw the object); the
+    #            3D footprint (centre/voxels) uses the valid pixels when there are any, else
+    #            all owned pixels — a proposal always keeps at least one 3D point.
+    proposal_conf_mode: str = "gate"
+    # Proposal mode for the LOOP-VERIFICATION evidence of the current frame only. When it
+    # differs from proposal_conf_mode a second (cheap) make_proposals pass over the same model
+    # output builds a per-frame transient bag {descriptor, camera-frame centre} that is stored
+    # in FrameIndex for verification but never matched into the InstanceTable / map.
+    lc_proposal_conf_mode: str = "prefer"
+    # History side of the rigid check: 'map' = the history frame's map instances (aggregated
+    # descriptors + that frame's centres; capped by the gate proposals that became instances) or
+    # 'bag' = the history frame's own transient bag recorded when it was processed (same evidence
+    # rule on both sides; still never enters the map).
+    lc_history: str = "bag"
     conf_gate_coef: float = 1.0
 
     # instance matching (score = w_desc*cos + w_vox*iou + w_geo*exp(-d/sigma), hungarian)
+    # 2026-09-04 main-method change (docs/config_change_2026-09-04.md): the voxel-overlap cue is
+    # dropped and the descriptor carries most of the weight; the bar moves 0.32 -> 0.65 because the
+    # surviving weights were rescaled to sum to 1.0 (same 65 %-of-maximum as the desc-only arm).
+    # `--assoc old` restores 0.30/0.30/0.25 @ 0.32.
     knn_radius: float = 1.0
     max_candidates: int = 32
-    match_threshold: float = 0.32
-    w_desc: float = 0.3
+    match_threshold: float = 0.65
+    w_desc: float = 0.70
     w_sem: float = 0.0
-    w_vox: float = 0.3
-    w_geo: float = 0.25
+    w_vox: float = 0.0
+    w_geo: float = 0.30
     sigma_dist: float = 0.25
     embed_update: str = "mean"
     embed_momentum: float = 0.75
-    merge_desc_high: float = 0.75                 # final merge pass (export)
+    # final merge pass (export).  'desc' = the reference implementation's rule (pure accumulated-
+    # descriptor cosine >= merge_desc; semantic_mapping/stages/merging.py:116) — cue-invariant, so
+    # changing the matching weights can never move it.  'fused' = this repo's older local rule
+    # (w_desc*cos + w_vox*iou + w_geo*geo >= merge_desc_high), kept to reproduce runs before
+    # 2026-09-04; note its scale depends on the weights (max 0.85 old, 1.00 new).
+    merge_mode: str = "desc"
+    merge_desc: float = 0.85
+    merge_desc_high: float = 0.75
 
     # noise filter at export (subset of filter_noise_instances)
     filter_min_count: int = 1
@@ -185,14 +218,14 @@ class SemConfig:
     # KV policy: 'none' (frozen-config default: flat KV, no pruning) | 'window'
     # | 'h2o' (STAC-style temporal compression — pinned frame-0 + recent window
     # + per-layer/per-head heavy-hitter tokens; bounded memory; plan S5).
-    kv_policy: str = "none"
+    kv_policy: str = "h2o"
     kv_window_size: Optional[int] = None
     kv_keyframe_stride: Optional[int] = None
     # h2o knobs (kv_policy='h2o'); budgets are in frames / frame-equivalents.
     h2o_recent_frames: int = 8
     h2o_hh_frames: int = 8
     h2o_decay: float = 0.9                        # score decay γ (STAC 'temperature')
-    h2o_subsample: float = 1.0                    # query subsample for colsum scores
+    h2o_subsample: float = 0.25                   # query subsample for colsum scores
     h2o_attn_backend: str = "triton"              # 'triton' | 'cuda' (attn-cuda ext)
     # KV reset valve (default OFF; log pose deltas regardless — measure first)
     kv_reset: bool = False
@@ -201,6 +234,7 @@ class SemConfig:
     # debug
     save_2d_masks: bool = False
     snapshot_dir: str = ""                       # per-submap reconstruction snapshots (video)
+    snapshot_pts: int = 50000                    # points kept per submap in a snapshot
     mask_2d_top_k: int = 15
 
     @property

@@ -34,7 +34,7 @@ from ma_slam.loop import ImageRetrieval
 from align.sim3utils import weighted_align_point_maps
 
 DEFAULT_CONFIG: Dict = {
-    "submap_size": 16,        # new frames per submap (excludes the shared overlap frame)
+    "submap_size": 32,        # new frames per submap (excludes the shared overlap frame)
     "overlap": 1,             # shared frames between consecutive submaps (only 1 supported)
     "conf_percentile": 25.0,  # per-submap conf threshold (drop lowest X% when exporting)
     "scale_correction": True, # auto-gated: only applied in scaleless modes (no depth input)
@@ -48,8 +48,10 @@ DEFAULT_CONFIG: Dict = {
     "Graph": {"manifold": "se3", "inner_sigma": 0.03, "intra_sigma": 0.05,
               "anchor_sigma": 1e-6, "loop_sigma": 0.10,
               "loop_robust": "huber", "loop_robust_k": 1.345},
-    "Loop": {"enable": True, "sim_threshold": 0.50, "min_submap_gap": 2,
-             "coloc_ratio": 0.70, "max_per_submap": 1, "half_window": 0,
+    # Retrieval = the "relaxed" setting of the latest Ident3R-SLAM tables (SALAD cos >= 0.40,
+    # top-5 per submap; the instance gate keeps false loops out). Old default: 0.50 / 1.
+    "Loop": {"enable": True, "sim_threshold": 0.40, "min_submap_gap": 2,
+             "coloc_ratio": 0.70, "max_per_submap": 5, "half_window": 0,
              # Rotation gate (free, pre-verification): reject candidates whose
              # graph-estimated relative rotation exceeds this. Rotation barely drifts
              # (measured vs GT on TUM fr1: median 0-1 deg, max 15 over 500-frame gaps),
@@ -74,7 +76,9 @@ DEFAULT_CONFIG: Dict = {
              # prove itself harder; PASS/UNKNOWN keep coloc_ratio). Spares
              # excellent-coloc real loops (360 194<->95 @0.044) while killing
              # borderline coloc mis-accepts (office 125<->25 @0.554, floor 0.700).
-             "Instance": {"enable": True, "shadow": True, "veto": False,
+             # Default = the shipped method (IDLV): veto + rigid pair-count verdict
+             # (ma_slam_semantic BiDescConfig mode='rigid', rigid_geom=False).
+             "Instance": {"enable": True, "shadow": False, "veto": True,
                           "tier_b_floor": 0.45, "max_tier_b": 2,
                           "coloc_ratio_b": 0.50, "coloc_ratio_veto": 0.45,
                           # S1 UNKNOWN (no instance evidence) hard-rejects instead of
@@ -84,7 +88,10 @@ DEFAULT_CONFIG: Dict = {
                           # cluster-redundant (360 +0.001, teddy ~0, s0231 -0.001),
                           # and it closes the coloc-solo path (teddy 1043<->0 gray
                           # accept; v1-era 447<->141 / 269<->145 wrong accepts).
-                          "unknown_fail": True},
+                          "unknown_fail": True,
+                          # Stage-2 statuses that hard-reject (no coloc). Others
+                          # (and S1/S2 FAIL) fall through to coloc with the raised bar.
+                          "s2_hard_reject": ("LARGE_VIEW_CHANGE", "T_FAR", "M_LOW")},
              # debug: dump each loop candidate's two re-inferred windows as a green(query)/
              # red(match) PLY in <out>/coloc/ so co-location accept/reject can be eyeballed.
              "debug_coloc": False,
@@ -359,6 +366,20 @@ class MaSlam:
         coloc = float(np.linalg.norm(ctr[:la].mean(0) - ctr[la:].mean(0)) / ref)
         passed = coloc <= (coloc_max if coloc_max is not None
                            else self.cfg["Loop"]["coloc_ratio"])
+        jv = None
+        if passed and commit and self.hooks is not None and self.cfg["Loop"]["Instance"].get("joint") \
+                and hasattr(self.hooks, "verify_joint"):
+            # joint semantic verification on the SAME re-inferred window (query frame = index of
+            # cand.query_frame in qa, history frame = la + index in mb)
+            iq = qa.index(cand.query_frame); ir = la + mb.index(cand.match_frame)
+            jv = self.hooks.verify_joint(out, iq, ir, sm.image_paths[cand.query_frame],
+                                         match_sm.image_paths[cand.match_frame])
+            jl = (f"JOINT {jv.summary()} coloc={coloc:.3f} sim={cand.similarity:.2f} "
+                  f"q={cand.query_base}+{cand.query_frame} m={cand.match_base}+{cand.match_frame} "
+                  f"qimg={sm.image_paths[cand.query_frame]} mimg={match_sm.image_paths[cand.match_frame]}")
+            self.loop_log.append(jl); print(f"[ma_slam] {jl}")
+            if jv.status != "PASS":
+                passed = False
         # Parseable per-candidate record (image paths included for manual inspection).
         qimg, mimg = sm.image_paths[cand.query_frame], match_sm.image_paths[cand.match_frame]
         line = (f"LOOPCAND {'ACCEPT' if passed else 'REJECT'}{'' if commit else '-DRY'} "
@@ -400,8 +421,12 @@ class MaSlam:
             match_sm = self.map.get(cand.match_base)
             qimg = sm.image_paths[cand.query_frame]
             mimg = match_sm.image_paths[cand.match_frame]
+            if inst.get("joint") and tier == "A":
+                if veto and self._add_loop_constraint(sm, cand, coloc_max=None):
+                    self._unopt_loop_edges += 1
+                continue
             v = self.hooks.verify_loop_candidate(qimg, mimg)
-            line = (f"BIDESC {tier} {v.summary()} sim={cand.similarity:.2f} "
+            line = (f"{'RIGID' if getattr(v, 'rigid', False) else 'BIDESC'} {tier} {v.summary()} sim={cand.similarity:.2f} "
                     f"q={cand.query_base}+{cand.query_frame} "
                     f"m={cand.match_base}+{cand.match_frame} qimg={qimg} mimg={mimg}")
             self.loop_log.append(line)
@@ -420,6 +445,18 @@ class MaSlam:
             if tier == "A":
                 if not veto:
                     continue                     # shadow bookkeeping only
+                if getattr(v, "rigid", False):
+                    # rigid mode: PASS -> normal coloc; UNKNOWN (low-object, coloc policy) ->
+                    # normal coloc; REJECT -> hard reject (positive evidence required)
+                    if v.status == "REJECT":
+                        line = (f"RIGID REJECT {v.reason} q={cand.query_base}+{cand.query_frame} "
+                                f"m={cand.match_base}+{cand.match_frame} qimg={qimg} mimg={mimg}")
+                        self.loop_log.append(line)
+                        print(f"[ma_slam] {line}")
+                        continue
+                    if self._add_loop_constraint(sm, cand, coloc_max=None):
+                        self._unopt_loop_edges += 1
+                    continue
                 # Stage 2 consumption: LVC / T_FAR are the cases where coloc has
                 # NO discriminating power (rotation-blind position check accepted
                 # all 8 GT-false edges of these types) -> hard reject, no coloc.
@@ -432,7 +469,8 @@ class MaSlam:
                     print(f"[ma_slam] {line}")
                     continue
                 s2 = getattr(v, "layout", None)
-                if s2 is not None and s2.status in ("LARGE_VIEW_CHANGE", "T_FAR", "M_LOW"):
+                if s2 is not None and s2.status in tuple(inst.get("s2_hard_reject",
+                                                            ("LARGE_VIEW_CHANGE", "T_FAR", "M_LOW"))):
                     line = (f"S2GATE REJECT {s2.status} "
                             f"q={cand.query_base}+{cand.query_frame} "
                             f"m={cand.match_base}+{cand.match_frame} "
@@ -442,7 +480,7 @@ class MaSlam:
                     continue
                 # FAIL (either stage) raises the coloc bar to coloc_ratio_veto —
                 # the candidate must geometrically prove itself harder.
-                fail = v.status == "FAIL" or (s2 is not None and s2.status == "FAIL")
+                fail = v.status == "FAIL" or (s2 is not None and s2.status not in ("PASS", "UNKNOWN"))
                 cv = inst.get("coloc_ratio_veto") if fail else None
                 if self._add_loop_constraint(sm, cand, coloc_max=cv):
                     self._unopt_loop_edges += 1

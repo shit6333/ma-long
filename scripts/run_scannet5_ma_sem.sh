@@ -18,23 +18,25 @@ PY=/mnt/HDD4/ricky/envs/amb3r_bw/bin/python
 GPU=${GPU:-0}
 OUT=${OUT:?set OUT=outputs/ma_sem/<tag>}
 KV_ARGS=${KV_ARGS:-}
+EXTRA_ARGS=${EXTRA_ARGS:-}      # e.g. --proposal_conf prefer
 DATA=/mnt/HDD4/ricky/data/slam_data/data/ScanNet
 OSR=/mnt/HDD4/ricky/OpenSe3r
 S200=$OSR/scannet_200
 SUM=$OUT/SUMMARY.txt
 ROOT=$(pwd)
-SCENES="scene0011_00 scene0050_00 scene0231_00 scene0378_00 scene0518_00"
+SCENES=${SCENES:-"scene0011_00 scene0050_00 scene0231_00 scene0378_00 scene0518_00"}
 
 mkdir -p $OUT
-echo "ma_slam_semantic scannet-5 (--geometry ma, submap 20, chunk 4, DA3 rgb; KV_ARGS='${KV_ARGS}')  $(date)" > $SUM
+[ -f $SUM ] || echo "ma_slam_semantic scannet-5 (--geometry ma, submap 20, chunk 4, DA3 rgb; KV_ARGS='${KV_ARGS}')  $(date)" > $SUM
 
 for SC in $SCENES; do
   echo "======== $SC  $(date) ========" | tee -a $SUM
   odir=$OUT/$SC; mkdir -p $odir
   # 1. SLAM + semantics
   PYTHONPATH=src CUDA_VISIBLE_DEVICES=$GPU $PY -u -m ma_slam_semantic.run \
-      --geometry ma --data $DATA/$SC --backend da3 --mode rgb --submap_size 20 \
-      --out $odir --gt $DATA/$SC/gt_pose.txt --conf_gate_coef 1.0 ${KV_ARGS} > $odir/run.log 2>&1
+      --geometry ma --data $DATA/$SC --backend da3 --mode rgb --submap_size 20 --keyframe_disparity 25 --sim_threshold 0.50 --max_per_submap 1 \
+      --sem_lc shadow --bd_s2 on --sem_lc_mode bidesc --lc_proposal_conf gate --lc_history map --kv_policy none --h2o_subsample 1.0 \
+      --out $odir --gt $DATA/$SC/gt_pose.txt --conf_gate_coef 1.0 --gt_mesh $DATA/$SC/${SC}_vh_clean_2.labels.ply ${KV_ARGS} ${EXTRA_ARGS} > $odir/run.log 2>&1
   grep -E "Sim3-ATE|exported" $odir/run.log | tail -2 | tee -a $SUM
   # 2. instance AP (SN200; class-agnostic SN20 is identical under this protocol)
   (cd $OSR && $PY eval_instance_npz_scannet.py \

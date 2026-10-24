@@ -33,7 +33,7 @@ def main():
     ap = argparse.ArgumentParser(description="ma_slam (VGGT-SLAM-style, MapAnything backbone)")
     ap.add_argument("--scene"); ap.add_argument("--image_dir"); ap.add_argument("--depth_dir")
     ap.add_argument("--intrinsic"); ap.add_argument("--mode", default="rgb", choices=list(MODES))
-    ap.add_argument("--backend", default="ma", choices=["ma", "da3"],
+    ap.add_argument("--backend", default="da3", choices=["ma", "da3"],
                     help="reconstruction backbone: 'ma' MapAnything (4 modes) | "
                          "'da3' DA3NESTED-GIANT-LARGE-1.1 (metric rgb / rgb+intr, no depth input)")
     ap.add_argument("--da3_ray_pose", action="store_true",
@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--submap_size", type=int, default=32)
     ap.add_argument("--no_loop", action="store_true")
     ap.add_argument("--sim_threshold", type=float, default=DEFAULT_CONFIG["Loop"]["sim_threshold"])
+    ap.add_argument("--max_per_submap", type=int, default=DEFAULT_CONFIG["Loop"].get("max_per_submap", 1))
     ap.add_argument("--coloc_ratio", type=float, default=DEFAULT_CONFIG["Loop"]["coloc_ratio"])
     ap.add_argument("--rot_max_deg", type=float, default=DEFAULT_CONFIG["Loop"]["rot_max_deg"],
                     help="reject loop candidates whose graph-estimated relative rotation exceeds this (0 = off)")
@@ -55,7 +56,7 @@ def main():
     ap.add_argument("--debug_coloc", action="store_true",
                     help="dump each loop candidate's two re-inferred windows as a "
                          "green(query)/red(match) PLY in <out>/coloc/ for visual inspection")
-    ap.add_argument("--keyframe_disparity", type=float, default=25.0,
+    ap.add_argument("--keyframe_disparity", type=float, default=50.0,
                     help="LK disparity keyframe gate (pixels): drop frames whose mean optical-flow "
                          "displacement vs the last keyframe is below this. Default 25 (on); "
                          "0 = off (consecutive frames). submap_size then counts keyframes.")
@@ -120,7 +121,7 @@ def main():
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["submap_size"] = a.submap_size
     cfg["Graph"]["manifold"] = a.manifold
-    cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold, rot_max_deg=a.rot_max_deg,
+    cfg["Loop"].update(enable=not a.no_loop, sim_threshold=a.sim_threshold, max_per_submap=a.max_per_submap, rot_max_deg=a.rot_max_deg,
                        coloc_ratio=a.coloc_ratio, half_window=a.loop_half_window,
                        debug_coloc=a.debug_coloc)
     cfg["Pointcloud"].update(voxel_size=a.voxel_size, max_points=a.max_points, conf_coef=a.conf_coef)

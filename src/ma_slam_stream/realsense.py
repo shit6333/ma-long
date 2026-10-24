@@ -320,7 +320,7 @@ def add_capture_args(ap: argparse.ArgumentParser):
     g.add_argument("--fps", type=int, default=30)
     g.add_argument("--k", type=int, default=3,
                    help="blur window: keep the sharpest of every k frames (1 = every frame)")
-    g.add_argument("--keyframe_disparity", type=float, default=25.0,
+    g.add_argument("--keyframe_disparity", type=float, default=50.0,
                    help="LK keyframe gate (px), runs on the producer AFTER blur-select: drop frames "
                         "whose mean optical-flow displacement vs the last keyframe is below this. "
                         "Default 25 (on); 0 = off. submap_size then counts keyframes.")

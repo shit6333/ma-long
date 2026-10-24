@@ -248,6 +248,8 @@ def render_one(rec, out_png, res, salad=None):
     gate, _ = final_gate(s1, s2)
     if salad is not None:
         gate = f"SALAD {salad:.2f}  |  {gate}"
+    elif rec.get("salad") is not None:          # VGGT-SLAM plug-in dumps: L2 distance (lower = closer)
+        gate = f"SALAD-L2 {rec['salad']:.2f}  |  {gate}"
     sims = "  ".join(f"{k}:{p['sim']:.2f}" for k, p in enumerate(uniq))
     l1 = (f"S1 {s1['status']}  a_qr={s1['a_qr']:.2f} a_rq={s1['a_rq']:.2f} "
           f"a_bi={s1['a_bi']:.2f}  nuniq={s1['n_uniq']}  nq/nr={s1['n_q']}/{s1['n_r']}"

@@ -49,6 +49,16 @@ def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
     if transformation is not None:
         import torch
         transformation = torch.as_tensor(transformation, dtype=torch.float32)
+        # The writers invert the 4x4 with (p - t) @ R, which is only correct for orthonormal R.
+        # A Sim3 alignment passes R = s*Rot -> install a generic inverse (identical result for SE3).
+        import amb3r.vis_query_instance_slam as _w
+        import numpy as _np
+        def _invert_generic(points_np, T):
+            if T is None:
+                return points_np
+            Rm = T[:3, :3].cpu().numpy().astype(_np.float64); tv = T[:3, 3].cpu().numpy().astype(_np.float64)
+            return ((points_np.astype(_np.float64) - tv[None, :]) @ _np.linalg.inv(Rm).T).astype(_np.float32)
+        _w._invert_transform = _invert_generic
 
     n_relift = table.rekey_all(force=True)          # final heal through the final graph
     n_merged = table.final_merge() if do_final_merge else 0

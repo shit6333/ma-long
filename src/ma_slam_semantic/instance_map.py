@@ -472,7 +472,13 @@ class InstanceTable:
                 }
                 if a.sem_query is not None:
                     prop_view["sem_query"] = a.sem_query
-                if self._score(prop_view, b) >= self.cfg.merge_desc_high:
+                if getattr(self.cfg, "merge_mode", "fused") == "desc":
+                    # reference rule: pure accumulated-descriptor cosine (both are L2-normalised),
+                    # independent of the matching cue weights
+                    ok = float((a.descriptor * b.descriptor).sum()) >= self.cfg.merge_desc
+                else:
+                    ok = self._score(prop_view, b) >= self.cfg.merge_desc_high
+                if ok:
                     ra, rb = find(ids[a_i]), find(ids[b_i])
                     if ra != rb:
                         parent[max(ra, rb)] = min(ra, rb)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -84,6 +85,9 @@ def _sem_mode(cfg: SemConfig, sem_dense, sem_backbone) -> str:
 
 
 # --------------------------------------------------------------------------- GPU path
+_PROP_STATS = bool(int(os.environ.get("MA_PROP_STATS", "0")))   # per-frame funnel counts (debug)
+
+
 @torch.no_grad()
 def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
                    ) -> Tuple[List[Dict], torch.Tensor, torch.Tensor]:
@@ -124,7 +128,10 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
     if conf.shape[1:3] != (H, W):
         conf = F.interpolate(conf.unsqueeze(1), size=(H, W),
                              mode="bilinear", align_corners=False).squeeze(1)
-    keep = (pts.norm(dim=-1) > 1e-3) & (conf >= cfg.point_conf_threshold)
+    finite = pts.norm(dim=-1) > 1e-3
+    valid3d = finite & (conf >= cfg.point_conf_threshold)
+    prefer = getattr(cfg, "proposal_conf_mode", "gate") == "prefer"
+    keep = finite if prefer else valid3d          # ownership mask handed to resolve_per_pixel
 
     top_k = int(cfg.obj_top_k) if cfg.obj_top_k and int(cfg.obj_top_k) > 0 else None
     proposals: List[Dict] = []
@@ -134,11 +141,16 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
         # 1) objectness gate (+ optional top-k), mirroring process_chunk_to_proposals
         base = obj[t].sigmoid()
         active = base > cfg.obj_threshold
+        _st = ({"fi": int(chunk["frame_idx"][t]) if chunk.get("frame_idx") is not None else -1,
+                "N": int(N), "act": int(active.sum()), "objmax": round(float(base.max()), 3),
+                "keep%": round(float(keep[t].float().mean() * 100), 1), "nms": 0, "final": 0}
+               if _PROP_STATS else None)
         if top_k is not None and top_k < N:
             tm = torch.zeros_like(active)
             tm[base.topk(top_k).indices] = True
             active &= tm
         if not active.any():
+            if _st: print(f"[propstats] t={t} {_st}", flush=True)
             continue
         active_idx = active.nonzero(as_tuple=True)[0]
 
@@ -152,9 +164,11 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
             mbin = ml[t, active_idx].sigmoid() > 0.5
             kept_local = mask_nms(mbin, base[active_idx], iou_threshold=cfg.nms_iou)
         if kept_local.numel() == 0:
+            if _st: print(f"[propstats] t={t} {_st}", flush=True)
             continue
         kept = active_idx[kept_local]                               # [K] global slot ids
         K = int(kept.numel())
+        if _st: _st["nms"] = K; _n0 = len(proposals)
 
         # 3) pixel ownership (panoptic per-pixel argmax)
         owner, _, act = resolve_per_pixel(ml[t, kept], obj[t, kept], keep[t],
@@ -182,6 +196,10 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
             mask_k = (owner == k_local) & act
             if not mask_k.any():
                 continue
+            if prefer:
+                mk_valid = mask_k & valid3d[t]
+                if mk_valid.any():
+                    mask_k = mk_valid             # 3D footprint from valid pixels when available
             p = pts[t][mask_k]
             p = p[torch.isfinite(p).all(dim=-1)]
             P = int(p.shape[0])
@@ -219,6 +237,9 @@ def make_proposals(out: dict, chunk: dict, cfg: SemConfig, sem_backbone=None
                 prop["pq_q"] = float(pq_q[t, slot].sigmoid().item())
             pixel_to_proposal[t][mask_k] = len(proposals)
             proposals.append(prop)
+        if _st:
+            _st["final"] = len(proposals) - _n0
+            print(f"[propstats] t={t} {_st}", flush=True)
 
     return proposals, pixel_to_proposal.cpu(), pts.cpu()
 

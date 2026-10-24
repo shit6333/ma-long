@@ -37,7 +37,7 @@ run_one() {
   local log="$out.log"; mkdir -p "$out"
   PYTHONPATH=src CUDA_VISIBLE_DEVICES="$GPU" "$PY" -m ma_slam.run \
       --scene "$scene" --mode "$mode" --backend "$backend" --manifold se3 \
-      --submap_size "$sz" $extra \
+      --submap_size "$sz" --keyframe_disparity 25 --sim_threshold 0.50 --max_per_submap 1 $extra \
       --out "$out" --gt "$scene/gt_pose.txt" 2>&1 | tee "$log"
   # scrape the eval line: "[ma_slam] Sim3-ATE=.. | SE3-ATE=.. | scale=.. | submaps=.. | loops=.."
   local line; line=$(grep -E "Sim3-ATE=" "$log" | tail -1 || true)
