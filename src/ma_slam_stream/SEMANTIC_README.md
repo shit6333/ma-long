@@ -10,6 +10,19 @@ Architecture, benchmarks and evaluation live in
 [ma_slam_semantic/README.md](../ma_slam_semantic/README.md) and [docs/RESULTS.md](../../docs/RESULTS.md);
 camera / transport / viewer details in [README.md](README.md).
 
+> **Get the weights first (19.4 GB, not in git):**
+> download `weights.zip` from **<https://drive.google.com/file/d/14ehvtDS3wR03mR8B0aNzxOKe4VyI51QW/view>**
+> (Google Drive folder `ident3r_slam/ident3r_weights/`), verify, and unzip at the repo root:
+>
+> ```bash
+> sha256sum weights.zip   # expect 90823b7d79b7e5ec18af05786f3f306b0025a781e6d006a043f52410812aed0d
+> unzip weights.zip       # -> vendor/weights/, src/weights/, cache/, WEIGHTS_README.txt
+> export HF_HOME=$PWD/cache/huggingface TORCH_HOME=$PWD/cache/torch
+> ```
+>
+> Large Google Drive files often fail with `gdown` ("too many downloads"); use the browser or
+> `rclone`. Contents and details: [§2](#2-weights-19-gb).
+
 ```
 producer (laptop/robot): camera ─ blur filter (--k) ─ 50 px LK keyframe gate ─► zmq / local / folder
 server (GPU):  DA3 submap reconstruction (32 keyframes, RGB only, metric) ─ SE(3) pose graph (gtsam)
