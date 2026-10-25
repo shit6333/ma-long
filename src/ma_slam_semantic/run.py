@@ -299,6 +299,9 @@ def main():
     ap.add_argument("--conf_gate_coef", type=float, default=1.0,
                     help="[ma] scale on the per-submap mean-conf validity gate "
                          "(<1 keeps more points -> more coverage, noisier voxels)")
+    ap.add_argument("--filter_min_count", type=int, default=1,
+                    help="[ma] export noise filter: drop instances observed <= N times "
+                         "(1 = paper setting; 2 = robot/streaming default)")
     ap.add_argument("--manifold", default="se3", choices=["se3", "sim3"],
                     help="[ma] pose-graph manifold: se3 (metric backbone, default) or sim3 "
                          "(per-submap scale — absorbs DA3 scale drift on textureless scenes)")
@@ -356,6 +359,7 @@ def main():
             w_, h_ = [int(x) for x in a.resolution.lower().split("x")]; res_kw["resolution"] = (w_, h_)
         res_kw.update(_assoc_kwargs(a))
         cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef,
+                        filter_min_count=a.filter_min_count,
                         **kv_kwargs, **model_kwargs, proposal_conf_mode=a.proposal_conf,
                         lc_proposal_conf_mode=a.lc_proposal_conf, lc_history=a.lc_history, **res_kw)
         run_ma_slam(a, cfg)

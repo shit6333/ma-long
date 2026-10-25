@@ -89,6 +89,38 @@ def _finalize(slam, out, n, elapsed, fps, vram, mode, compute_fps=None, compute_
             "poses_txt": poses_txt, "combined_ply": combined_ply, "fps": fps}
 
 
+def _live_tap(source, viz):
+    """Forward source frames through a thread that shows each keyframe in the viewer the moment
+    it arrives (the main loop is busy inside process_submap while frames keep coming)."""
+    import queue
+    import threading
+    q: "queue.Queue" = queue.Queue()
+
+    def run():
+        idx = 0
+        try:
+            for frame in source:
+                if frame is not None:
+                    viz.arrival[frame[0]] = idx
+                    try:
+                        viz.log_live_frame(frame[0], idx)
+                    except Exception as e:             # display must never kill SLAM
+                        print(f"[viz] live frame error: {e}")
+                    idx += 1
+                q.put(frame)
+                if frame is None:
+                    return
+        finally:
+            q.put(None)
+
+    threading.Thread(target=run, daemon=True).start()
+    while True:
+        frame = q.get()
+        if frame is None:
+            return
+        yield frame
+
+
 def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, dump_every,
                 viz=None, hooks=None):
     """Accumulate live keyframes into submaps and feed them to slam.process_submap.
@@ -129,20 +161,24 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
             raise ValueError("depth mode but a frame arrived without a depth path")
         tc = time.time()
         slam.process_submap(rgb, dep)
-        compute_s[0] += time.time() - tc          # count only the GPU/reconstruction work
+        dt = time.time() - tc
+        compute_s[0] += dt                        # count only the GPU/reconstruction work
         print(f"[ma_slam] submap {slam.stats['n_submaps']} (+{len(window)} frames, "
               f"{n_frames} total) | nodes={len(slam.graph.initialized)} "
               f"loops={slam.stats['n_loops']}")
         if viz is not None:
             loop_now = slam.stats["n_loops"]
-            viz.update(slam, n_frames, loop_happened=loop_now > loops_seen[0])
+            # frame-by-frame reveal of this submap (+ the instance snapshots the semantic
+            # hook collected per chunk inside process_submap)
+            viz.push_submap(slam, slam.map.latest(ignore_lc=True),
+                            loop_happened=loop_now > loops_seen[0], compute_s=dt)
             loops_seen[0] = loop_now
-            # Instance-colored semantic layer (hooks ran inside process_submap).
-            if hooks is not None and getattr(hooks, "table", None) is not None:
-                viz.update_instances(hooks.table, n_frames)
 
+    if viz is not None and hooks is not None:
+        hooks.chunk_callback = viz.collect_instances   # instance snapshot after every chunk
+    frames = _live_tap(source, viz) if viz is not None else source
     try:
-        for frame in source:                      # blocks until next frame / stop sentinel
+        for frame in frames:                      # blocks until next frame / stop sentinel
             if frame is None:
                 break
             if t_first[0] is None:
@@ -177,6 +213,8 @@ def stream_loop(slam, source, out, *, mode, intrinsics, depth_scale, depth_max, 
         slam._unopt_loop_edges = 0
     if hooks is not None:
         hooks.on_finish(slam.map, slam.graph)
+    if viz is not None:
+        viz.flush()                               # let the viewer finish revealing
     return _finalize(slam, out, n_frames, wall, wall_fps, vram, mode,
                      compute_fps=compute_fps, compute_s=compute_s[0])
 
@@ -219,7 +257,18 @@ def main():
     ap.add_argument("--viz_addr", default=None,
                     help="[viz connect] running rerun viewer url, e.g. rr+http://LAPTOP_IP:9876")
     ap.add_argument("--viz_max_points", type=int, default=500_000,
-                    help="cap on points logged to rerun (split across submaps)")
+                    help="point budget for the viewer (per revealed frame: viz_max_points/64)")
+    ap.add_argument("--viz_reveal", default="paced", choices=["paced", "instant"],
+                    help="paced = reveal each submap frame by frame over its compute time "
+                         "(continuous view, one submap behind live); instant = no pacing")
+    ap.add_argument("--viz_inst_style", default="points", choices=["points", "voxels"],
+                    help="instance layer: points = voxel-centre dots (cheap); "
+                         "voxels = solid translucent 5 cm cubes (nicer, heavier)")
+    ap.add_argument("--viz_inst_radius", type=float, default=0.25,
+                    help="[points] point radius as a fraction of the voxel size "
+                         "(0.5 = neighbours touch)")
+    ap.add_argument("--viz_inst_alpha", type=float, default=0.5,
+                    help="[voxels] cube opacity 0..1")
 
     # ── semantic mapping (ma_slam_semantic hooks; v0 = synchronous per submap) ──
     sp = ap.add_argument_group("semantic mapping")
@@ -228,6 +277,10 @@ def main():
                          "(SemanticHooks) — instance-colored voxels/bboxes in the viewer + "
                          "reference-format instance export at stop. Adds ~0.6 s/frame of "
                          "GPU work, so it bounds throughput on fast feeds (v0 is synchronous).")
+    sp.add_argument("--filter_min_count", type=int, default=2,
+                    help="export noise filter: drop instances observed <= N times "
+                         "(robot default 2 = keep only objects seen in >= 3 keyframes; "
+                         "the offline/paper setting is 1)")
     sp.add_argument("--sem_chunk_size", type=int, default=4,
                     help="frames per causal semantic forward (VRAM knob; results invariant)")
     sp.add_argument("--conf_gate_coef", type=float, default=1.0,
@@ -322,7 +375,9 @@ def main():
             source.close()
             ap.error(f"mode {a.mode} needs intrinsics but none given and none arrived on the stream")
 
-    viz = make_viz(a.viz, a.viz_addr, conf_coef=a.conf_coef, max_points=a.viz_max_points)
+    viz = make_viz(a.viz, a.viz_addr, conf_coef=a.conf_coef, max_points=a.viz_max_points,
+                   reveal=a.viz_reveal, inst_style=a.viz_inst_style, inst_alpha=a.viz_inst_alpha,
+                   inst_radius=a.viz_inst_radius)
 
     # Semantic hooks (optional). Built BEFORE stream_loop so the semantic model's
     # checkpoint load happens during startup, not after the READY banner.
@@ -334,6 +389,7 @@ def main():
             box_scale_mode     = "first_chunk",
             chunk_size         = a.sem_chunk_size,
             conf_gate_coef     = a.conf_gate_coef,
+            filter_min_count   = a.filter_min_count,
             kv_policy          = a.kv_policy,
             kv_window_size     = a.kv_window_size,
             kv_keyframe_stride = a.kv_keyframe_stride,

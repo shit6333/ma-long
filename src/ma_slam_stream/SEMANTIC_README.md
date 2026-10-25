@@ -88,7 +88,10 @@ cd src/ma_slam_stream
 python client.py --transport zmq --addr tcp://SERVER_IP:5599      # --mode rgb (default)
 ```
 
-**③** Open the full viewer URL the server prints and wait for `===== READY =====`.
+**③** Open the full viewer URL the server prints and wait for `===== READY =====`. The viewer
+shows each keyframe immediately in the *live keyframes* panel; the 3D view (points, camera frustum,
+trajectory, instances) is revealed frame by frame, one submap (32 keyframes) behind live, and the
+`frame` timeline can be scrubbed. On a loop closure every frame is redrawn with corrected poses.
 **④** Press ENTER in the client to start streaming. **Stop** with `Ctrl+C` in the client: the
 server optimizes the final graph and writes everything to `--out` (§6).
 
@@ -177,7 +180,7 @@ PYTHONPATH=src python -m ma_slam_semantic.deploy --dir outputs/maslam_live --nam
 
 | topic | value / behaviour | consequence for integration |
 |---|---|---|
-| compute | with `--semantic`: ~22 GB VRAM, ~16 GB host RAM, **~1 keyframe/s** end to end (smoke test, shared GPU, incl. warm-up); geometry only (no `--semantic`): 7–12 keyframes/s | run on a GPU server, not on the robot's onboard computer. Keyframe arrival rate depends on motion: TUM fr1_room (hand-held, 45 s) yields 186 keyframes at 50 px ≈ 4/s, faster than the semantic layer processes them — budget for lag, slower motion, or a faster GPU |
+| compute | with `--semantic`: ~21 GB VRAM, ~16 GB host RAM, **1.1–2.3 keyframes/s** of reconstruction in streaming tests (TUM fr1_room 2.3, ScanNet++ 1.1–1.9; the GPU was shared with another job, so expect the upper end on a dedicated GPU); the `voxels` viewer style costs ~40 % of that; geometry only (no `--semantic`): 7–12 keyframes/s | run on a GPU server, not on the robot's onboard computer. Keyframe arrival rate depends on motion: TUM fr1_room (hand-held, 45 s) yields 186 keyframes at 50 px ≈ 4/s, faster than the semantic layer processes them — budget for lag, slower motion, or a faster GPU |
 | pose latency | poses are produced **per submap** (32 keyframes at 50 px parallax) and re-optimized after every submap; loop edges land one submap later | not a high-rate odometry source — fuse with wheel odometry / VIO for control and use this as the mapping + loop-closure layer |
 | memory growth | host RAM ~7 MB per keyframe (dense point maps kept for export) plus instance observations; the semantic KV cache is bounded (Temporal Token Cache) | long missions grow RAM linearly; plan restarts or a map-saving policy |
 | optimization cost | full Levenberg–Marquardt over the whole graph after every submap | per-submap time grows with trajectory length |
@@ -208,6 +211,19 @@ PYTHONPATH=src python -m ma_slam_semantic.deploy --dir outputs/maslam_live --nam
 | `--conf_gate_coef` | 1.0 | geometry-validity gate for map points; keep 1.0 live |
 | `--kv_policy` | `h2o` | bounded KV cache (frame-0 anchor + 8 recent + 8 heavy-hitter frames, ~0.7 GB); `none` grows ~62 MB/frame |
 | `--h2o_recent` / `--h2o_hh` / `--h2o_decay` / `--h2o_subsample` | 8 / 8 / 0.9 / 0.25 | Temporal Token Cache budgets |
+| `--filter_min_count` | **2** (streaming) | export noise filter: drop instances observed ≤ N times. Streaming/robot default 2 keeps only objects seen in ≥ 3 keyframes (ScanNet++ test: 32 of 169 dropped vs 17 at 1); the offline runner keeps the paper setting 1 |
+
+**Viewer arguments**
+
+| arg | default | meaning |
+|---|---|---|
+| `--viz` | `none` | `web` (browser URL), `spawn` (native window), `connect` (remote rerun viewer) |
+| `--viz_reveal` | `paced` | `paced` = reveal each submap frame by frame over its compute time; `instant` = no pacing |
+| `--viz_inst_style` | `points` | instance layer: `points` (cheap) or `voxels` (solid translucent 5 cm cubes, nicer but ~40 % slower overall) |
+| `--viz_inst_radius` / `--viz_inst_alpha` | 0.25 / 0.5 | point radius as a fraction of the voxel / cube opacity |
+| `--viz_max_points` | 500,000 | viewer point budget (per revealed frame: /64) |
+
+On the robot server prefer `--viz none` (or `points`); the viewer is for debugging and demos.
 
 Geometry and loop args (`--backend`, `--mode`, `--submap_size`, `--sim_threshold`,
 `--max_per_submap`, `--coloc_ratio`, `--no_loop`, viewer, transport) are in [README.md](README.md) §3–4.

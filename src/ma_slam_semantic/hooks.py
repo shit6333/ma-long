@@ -81,6 +81,9 @@ class SemanticHooks:
                                                sem_backbone=self.model.semantic_backbone)
             assign = self.table.match_chunk(props, sub["frame_keys"], pix_map)
             paths = [sm.image_paths[i] for i in sub["frame_idx"]]
+            cb = getattr(self, "chunk_callback", None)    # e.g. the stream viewer
+            if cb is not None:
+                cb(self.table, paths)
             # Camera-frame 3D centres for Stage-2 layout graphs: undo the frame's
             # global pose so the stored position is a pure per-frame observation
             # (drift-free, healing-independent). Per-axis median doesn't strictly
