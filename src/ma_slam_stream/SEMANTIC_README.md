@@ -227,3 +227,91 @@ On the robot server prefer `--viz none` (or `points`); the viewer is for debuggi
 
 Geometry and loop args (`--backend`, `--mode`, `--submap_size`, `--sim_threshold`,
 `--max_per_submap`, `--coloc_ratio`, `--no_loop`, viewer, transport) are in [README.md](README.md) §3–4.
+
+## 11. Code map for integrators (e.g. building a ROS bridge)
+
+The system is **not a ROS node**: it reads frames from one of three transports and writes
+results to files at stop (plus the live rerun viewer). This section lists where things are in the
+code so a bridge can be written by hand or with an AI assistant. Paths are relative to `src/`.
+
+### 11.1 Process and threads
+
+```
+run_stream.py  main() ── builds MaSlam (+ SemanticHooks with --semantic, + RerunViz with --viz)
+               stream_loop()                                   run_stream.py:124
+                 source thread    (sources.py)   receives frames, writes them to <out>/live/rgb/,
+                                                  queues (rgb_path, depth_path)
+                 live tap thread  (_live_tap)     shows each frame in the viewer       run_stream.py:92
+                 main thread      buffers submap_size keyframes (+1 overlap frame) ->
+                                  _process(window) -> MaSlam.process_submap()   run_stream.py:157
+                 viewer thread    (viz.py)        paced frame-by-frame reveal
+               at STOP: final optimize -> hooks.on_finish (instance export) -> _finalize (poses, cloud)
+```
+
+All SLAM state (pose graph, submaps, instance table) is mutated **only in the main thread inside
+`process_submap`**. Read it from the main thread right after `process_submap` returns, or copy it.
+The pipeline is path-based: every received frame is written once to disk on the server.
+
+### 11.2 Input transports (producer → server)
+
+Keyframe selection is **producer-side** in `zmq` / `folder` mode: the server processes every frame
+it receives, so a bridge must apply the blur filter and the 50 px keyframe gate itself. Reuse
+`ma_slam/keyframe_flow.py::DisparityKeyframer` (`step(frame_bgr) -> bool`, causal, OpenCV only).
+
+**zmq** (recommended). Server: `PULL`, binds `--bind tcp://*:5599` (`sources.py:118`). Producer:
+`PUSH` connect, reference implementation `ma_slam_stream/client.py::ZmqSender` (`client.py:42`).
+Each message is a multipart list:
+
+| message | parts | notes |
+|---|---|---|
+| META (optional in `rgb` mode) | `[b"META", json {"intrinsics": 3×3 list, "depth_scale": float}]` | needed only for `rgb+intr` / depth modes |
+| FRAME | `[b"FRAME", json {"idx": int, "rgb_ext": "jpg"}, rgb_bytes, depth_bytes_or_b""]` | `rgb_bytes` = encoded JPEG/PNG; depth = 16-bit PNG in mm (depth modes only). Unknown header keys are ignored, so a capture timestamp can be added without breaking the server (the server does not use it yet) |
+| STOP | `[b"STOP"]` | server finishes the queue, optimizes, exports, exits |
+
+Back-pressure: `RCVHWM`/`SNDHWM` 1000 messages and a 256-frame server queue — when the semantic
+layer is slower than keyframe arrival, frames wait in these buffers (latency grows); once they are
+full the producer's send blocks. Nothing is dropped silently.
+
+**folder** (`--source folder --watch_dir D`, `sources.py:182`): write `D/rgb/<name>.jpg` atomically
+(write `<name>.jpg.tmp`, then rename); frames are consumed in sorted file-name order; create the
+file `D/STOP` to finish. Reference: `client.py::FolderSender` (`client.py:63`).
+
+### 11.3 Where results become available (the place to publish from)
+
+After each submap, `run_stream.py:173` (where `viz.push_submap` is called) has:
+
+| data | how to read it | notes |
+|---|---|---|
+| keyframe poses | `for sm in slam.map.ordered(): T = slam.graph.get_pose(sm.key(i))` for `i in range(sm.n)` | 4×4 cam→world, OpenCV axes, world = first keyframe (§7). The overlap frame appears in two submaps — dedupe by `sm.image_paths[i]`. All poses can change after every submap (global re-optimization) and jump on loop closure |
+| per-frame point cloud | `sm.frame_points_global(slam.graph, i)` (`ma_slam/submap.py:127`) → (H,W,3) world points; confidence: `sm.conf[i] > sm.conf_threshold`; colours `sm.colors[i]` | `RerunViz._frame_payload` (`viz.py:270`) is a ready filtered + subsampled version |
+| instance map | `hooks.table.records` → `InstanceRecord` (`ma_slam_semantic/instance_map.py:119`): `inst_id, center, bbox_min, bbox_max, voxels` (5 cm grid indices), `count, descriptor` | `RerunViz._instance_payload` (`viz.py:189`) builds display arrays. Record geometry refreshes lazily after pose changes; exact positions come from the export at stop. Calling `table.rekey_all()` mid-stream would refresh them but also changes later association (not the evaluated behaviour) |
+| class labels | not available live | assigned at export by text classification (`ma_slam_semantic/deploy.py:79`) |
+| loop closures | `slam.stats["n_loops"]`, `slam.loop_log` (one line per candidate decision) | |
+
+At stop: `hooks.on_finish` → `ma_slam_semantic/export.py:32::export_all` (final re-lift, merge,
+noise filter, instance files) and `_finalize` (`run_stream.py:49`: `camera_poses.txt`,
+`combined_pcd.ply`, stats). The robot artifact set (§6) is then produced by `deploy.py`.
+
+### 11.4 Core classes (reference)
+
+| class / function | file | role |
+|---|---|---|
+| `MaSlam.process_submap` | `ma_slam/solver.py:547` | inference → placement → loop closure → `graph.optimize()` → `hooks.on_submap` → IDLV pass |
+| `PoseGraph.get_pose` / `optimize` | `ma_slam/graph.py:117` / `:109` | gtsam SE(3) graph, node key = submap base id + frame index |
+| `Submap` | `ma_slam/submap.py` | per-submap points (submap-local), poses, conf, image paths |
+| `SemanticHooks.on_submap` / `on_finish` | `ma_slam_semantic/hooks.py:65` / `:368` | Ident3R forward per 4-frame chunk, proposals, instance association; export |
+| `InstanceTable.match_chunk` | `ma_slam_semantic/instance_map.py:353` | association into the persistent instance map |
+| `RerunViz` | `ma_slam_stream/viz.py:32` | viewer; shows how to read every output above |
+
+### 11.5 Notes for a ROS bridge
+
+- Keep the SLAM server in its own process and Python environment (torch 2.8 + cu128, gtsam 4.3a0,
+  Python 3.10) and connect the ROS side over zmq: ROS1 Noetic (Python 3.8) cannot import this
+  code, and mixing ROS2 and this environment is fragile.
+- Input side needs no server change: subscribe the image topic, keyframe-gate, JPEG-encode, send
+  FRAME messages as in `ZmqSender`.
+- Output side needs a small server addition at `run_stream.py:173` (e.g. a zmq `PUB` of poses /
+  instance boxes / a subsampled cloud per submap); the ROS side republishes as TF, `nav_msgs/Path`,
+  `sensor_msgs/PointCloud2`, `visualization_msgs/MarkerArray`.
+- Trajectory timestamps are currently synthetic (`index / fps`); carry the image `header.stamp`
+  through the FRAME header if the robot needs real time alignment.
