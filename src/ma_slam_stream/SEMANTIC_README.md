@@ -59,9 +59,18 @@ Pitfalls:
 | HF `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | 6.3 GB | SLAM geometry backbone | auto-download, or ship `$HF_HOME/hub/models--depth-anything--DA3NESTED-GIANT-LARGE-1.1` |
 | torch hub `dinov2_vitb14_pretrain.pth` + `facebookresearch_dinov2_main/` | 350 MB | SALAD's DINOv2 | auto-download, or ship `$TORCH_HOME/hub/` |
 
-Not needed for this configuration: `opense3r_fastsam_query_semconf.pth` (old checkpoint),
-MapAnything weights (`--backend ma` only). The older `weights.zip` (2026-07-16) does **not**
-contain the current checkpoint.
+**All of the above ship in one `weights.zip` (19.4 GB, 2026-10-25, stored uncompressed).** Unzip it
+at the repo root, then point the caches at the bundled copies:
+
+```bash
+unzip weights.zip                       # creates vendor/weights/, src/weights/, cache/, WEIGHTS_README.txt
+export HF_HOME=$PWD/cache/huggingface TORCH_HOME=$PWD/cache/torch
+export HF_HUB_OFFLINE=1                 # optional: no network calls to HuggingFace
+```
+
+Not needed for this configuration (and not in the bundle): `opense3r_fastsam_query_semconf.pth`
+(old checkpoint), MapAnything weights (`--backend ma` only). The 2026-07-16 `weights.zip` has been
+replaced by this one.
 
 ## 3. Quickstart A — live: camera client → GPU server, with semantics
 
