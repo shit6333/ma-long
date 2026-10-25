@@ -103,8 +103,9 @@ def main():
     ap.add_argument("--transport", default="zmq", choices=["zmq", "folder"])
     ap.add_argument("--addr", default="tcp://127.0.0.1:5599", help="[zmq] server PULL address")
     ap.add_argument("--out_dir", help="[folder] dir the server watches")
-    ap.add_argument("--mode", default="rgb+depth+intr",
-                    help="must match the server; decides whether depth/intrinsics are sent")
+    ap.add_argument("--mode", default="rgb",
+                    help="must match the server (default rgb = the DA3 server default); "
+                         "decides whether depth/intrinsics are sent")
     ap.add_argument("--jpeg_quality", type=int, default=90)
     ap.add_argument("--max_frames", type=int, default=0,
                     help="stop after sending this many selected frames (0 = until Ctrl+C)")

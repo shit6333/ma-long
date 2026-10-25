@@ -36,15 +36,17 @@ you copied `realsense.py` + `client.py`.
 **① Server** (repo root) — binds the socket, serves the viewer, loads the model, prints `READY`:
 ```bash
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python -m ma_slam_stream.run_stream \
-    --source zmq --bind 'tcp://*:5599' --mode rgb+depth+intr --depth_max 6 \
-    --out outputs/maslam_live --submap_size 20 --viz web
+    --source zmq --bind 'tcp://*:5599' --out outputs/maslam_live --viz web
 ```
+Defaults = the Ident3R-SLAM config: `--backend da3 --mode rgb` (RGB only, metric), `--submap_size 32`,
+50 px keyframe gate. MapAnything with RealSense depth instead: add
+`--backend ma --mode rgb+depth+intr --depth_max 6` (and `--mode rgb+depth+intr` on the client).
 
 **② Client** (laptop) — sends intrinsics, then **waits at a `press ENTER` prompt** (it does NOT
 stream yet):
 ```bash
 cd src/ma_slam_stream
-python client.py --transport zmq --addr tcp://SERVER_IP:5599 --mode rgb+depth+intr
+python client.py --transport zmq --addr tcp://SERVER_IP:5599        # --mode rgb (default) must match the server
 ```
 
 **③ Open the viewer** — the server prints a full URL like
@@ -59,8 +61,7 @@ point cloud appear live. **Stop** with `Ctrl+C` in the client → the server flu
 ```bash
 cd /path/to/ma_long
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python -m ma_slam_stream.run_stream \
-    --source local --mode rgb+depth+intr --depth_max 6 \
-    --out outputs/maslam_live --submap_size 20 --k 3 --viz spawn
+    --source local --out outputs/maslam_live --k 3 --viz spawn
 ```
 Camera, reconstruction, and viewer all here; intrinsics come from the camera (no `--intrinsic`,
 no client). `--viz spawn` opens a native window; use `--viz web` + the printed URL if headless.
@@ -69,10 +70,11 @@ no client). `--viz spawn` opens a native window; use `--viz web` + the printed U
 
 | arg | meaning |
 |---|---|
-| `--mode {rgb, rgb+intr, rgb+depth, rgb+depth+intr}` | which inputs MapAnything uses. Depth modes are far more accurate; **use `rgb+depth+intr` with a RealSense**. |
-| `--backend {ma, da3}` | backbone: `ma` MapAnything (all modes) · `da3` DA3-nested (rgb / rgb+intr only, best rgb-only). |
-| `--submap_size` | **keyframes** per submap/chunk (default **20**; counts raw frames only if `--keyframe_disparity 0`). |
-| `--keyframe_disparity` | LK optical-flow keyframe gate (px): drop low-parallax frames before accumulation so `submap_size` counts keyframes (causal, same as offline). **Default 25** (on); `0` = off (every frame). Complements the client's `--k` blur filter (sharpness) with a parallax filter. |
+| `--mode {rgb, rgb+intr, rgb+depth, rgb+depth+intr}` | which inputs the backbone uses. **Default `rgb`** (DA3). Depth modes need `--backend ma` (MapAnything); with a RealSense use `rgb+depth+intr --depth_max 6`. |
+| `--backend {ma, da3}` | backbone: **`da3` (default)** DA3-nested (rgb / rgb+intr only, metric from RGB) · `ma` MapAnything (all modes). |
+| `--submap_size` | **keyframes** per submap/chunk (default **32**; counts raw frames only if `--keyframe_disparity 0`). |
+| `--keyframe_disparity` | LK optical-flow keyframe gate (px): drop low-parallax frames before accumulation so `submap_size` counts keyframes (causal, same as offline). **Default 50** (on); `0` = off (every frame). Complements the client's `--k` blur filter (sharpness) with a parallax filter. |
+| `--sim_threshold` / `--max_per_submap` | loop retrieval: SALAD cos threshold / candidates per submap (default **0.40 / 5**). |
 | `--depth_max` | zero out depth beyond N metres before the model — **set ~6 for RealSense** (far depth is noisy). |
 | `--manifold {se3, sim3}` | pose-graph group; `se3` (metric, default) is right for RealSense depth. |
 | `--no_loop` / `--coloc_ratio` | disable / tune loop closure. |
@@ -99,7 +101,7 @@ capture **848×480**, depth `visual_preset` **Medium Density**, **spatial + temp
 
 Stream to a rerun viewer already running on your laptop (laptop: run `rerun` first):
 ```bash
-PYTHONPATH=src python -m ma_slam_stream.run_stream --source zmq --mode rgb+depth+intr \
+PYTHONPATH=src python -m ma_slam_stream.run_stream --source zmq \
     --out outputs/maslam_live --viz connect --viz_addr rr+http://LAPTOP_IP:9876
 ```
 For `--viz connect` the laptop needs `pip install rerun-sdk==0.26.2` (version must match the
