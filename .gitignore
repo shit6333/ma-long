@@ -20,6 +20,9 @@ data/
 # Run outputs (poses, point clouds, logs, experiment results)
 outputs/
 
+# Maps / archives pulled from other machines
+downloads/
+
 # Local caches / scratch
 .cache/
 *.ply

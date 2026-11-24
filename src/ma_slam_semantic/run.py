@@ -1,13 +1,16 @@
-"""CLI runner for ma_slam_semantic.
+"""CLI runner for ma_slam_semantic (Ident3R-SLAM).
 
-Golden-test mode (S2/S3 correctness harness — GT geometry, bypasses ma_slam; must
-reproduce the reference OpenSe3r 005 GT run):
+Online SLAM + semantic instance mapping (default, ``--geometry ma``). The defaults ARE the final
+configuration — DA3 rgb, 50 px keyframes, 32-keyframe submaps, SALAD 0.40 / top-5 retrieval, IDLV loop
+verification, H2O KV — so a run needs only the data and output dirs:
 
-    PYTHONPATH=src python -m ma_slam_semantic.run --geometry gt \
-        --data /mnt/HDD4/ricky/data/instance_eval_data/scenenn/oni/005 \
-        --demo_type scenenn_gt --out outputs/ma_sem/005_gt --save_2d_masks
+    python src/ma_slam_semantic/run.py --data <scene_dir with rgb/> --out <out_dir> [--gt <gt_pose.txt>]
 
-ma_slam-geometry mode (S4) plugs SemanticHooks into ``ma_slam.run`` instead.
+Golden-test mode (correctness harness — GT geometry, bypasses ma_slam; reproduces the reference
+OpenSe3r GT run):
+
+    python src/ma_slam_semantic/run.py --geometry gt --data <scenenn_scene_dir> \
+        --demo_type scenenn_gt --out <out_dir> --save_2d_masks
 """
 
 from __future__ import annotations
@@ -59,6 +62,11 @@ def _assoc_kwargs(a):
     return kw
 
 
+def kv_info(cfg):
+    return {k: getattr(cfg, k, None) for k in ("kv_policy", "h2o_recent_frames", "h2o_hh_frames", "h2o_decay",
+                                               "h2o_subsample", "kv_window_size", "kv_keyframe_stride")}
+
+
 def run_ma_slam(a, cfg: SemConfig) -> None:
     """ma_slam-geometry mode: full online SLAM + semantic hooks."""
     import copy
@@ -106,6 +114,7 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
     # submap_size counts keyframes. GT for ATE eval is subsampled to the same keyframes
     # (per-index correspondence); hooks' gt_positions stays the FULL array — Submap
     # frame_ids are parsed from filenames, so original ordinals survive the subset.
+    n_input = len(image_paths)
     gt_positions = None; gt_poses = None
     if a.gt:
         _g = np.loadtxt(a.gt, comments="#").reshape(-1, 8)
@@ -162,8 +171,22 @@ def run_ma_slam(a, cfg: SemConfig) -> None:
                           desc_src=a.bd_desc_src, s2_enable=(a.bd_s2 == "on"),
                           dump_dir=(os.path.join(a.out, "semlc_dump")
                                     if a.sem_lc_dump else ""))
+    esam_meta = None
+    if a.esam_geo:
+        import subprocess
+        try:
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                                    cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
+        except Exception:
+            commit = ""
+        esam_meta = dict(dataset=(a.dataset or os.path.basename(os.path.dirname(os.path.normpath(a.data)))),
+                         data=os.path.abspath(a.data), n_input_frames=n_input, n_keyframes=len(image_paths),
+                         keyframe_disparity=a.keyframe_disparity, submap_size=a.submap_size,
+                         sem_chunk_size=cfg.chunk_size, resolution=list(cfg.resolution), kv=kv_info(cfg),
+                         ckpt=a.ckpt, git_commit=commit, args=vars(a))
     hooks = SemanticHooks(cfg, a.out, name=name, gt_positions=gt_positions, gt_poses=gt_poses, align_mode=a.align, gt_mesh=a.gt_mesh,
-                          lc_cfg=lc_cfg)
+                          lc_cfg=lc_cfg, esam_geo=a.esam_geo, esam_meta=esam_meta)
+    hooks.demo_dump = a.demo_dump
     if a.sim_threshold is not None:
         slam_cfg["Loop"]["sim_threshold"] = a.sim_threshold
     if a.max_per_submap is not None:
@@ -194,7 +217,9 @@ def main():
     ap.add_argument("--demo_type", default="scenenn_gt", choices=["scenenn_gt", "scannet_gt"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--name", default=None, help="export prefix (default: basename of --data)")
-    ap.add_argument("--chunk_size", type=int, default=8)
+    ap.add_argument("--chunk_size", type=int, default=None,
+                    help="frames per causal forward of the semantic model (default: 4 in 'ma' mode, "
+                         "8 in 'gt' mode)")
     ap.add_argument("--max_frames", type=int, default=0)
     ap.add_argument("--save_2d_masks", action="store_true",
                     help="dump per-frame top-K instance-mask grids (S2 eyeball gate)")
@@ -230,33 +255,36 @@ def main():
     ap.add_argument("--keyframe_disparity", type=float, default=50.0,
                     help="[ma] LK disparity keyframe gate in px (mirrors ma_slam.run; "
                          "0 = off, feed every frame)")
-    # instance-LC (semantic-assisted tier-B loop candidates; [ma] geometry only)
+    # Loop verification. The final method (IDLV) is the default: --sem_lc veto --sem_lc_mode rigid
+    # --rigid_geom off, with tau = --rigid_tau, m = --rigid_min_inliers, k = --bd_kbag.
+    # Flags marked [legacy] belong to earlier verifier designs (Bi-Desc S1, layout S2, tier-B mining);
+    # they are kept so archived runs stay reproducible and have no effect on the default path.
     ap.add_argument("--sem_lc", default="veto", choices=["off", "shadow", "enforce", "veto"],
-                    help="[ma] instance-bag gating of SALAD tier-B candidates "
-                         "(shadow = log SEMLC verdicts only)")
+                    help="[ma] instance-level loop verification: veto = IDLV gate on every SALAD candidate "
+                         "(default); off = geometric check only; shadow / enforce = [legacy] tier-B mining")
     ap.add_argument("--sem_lc_floor", type=float, default=0.45,
-                    help="[ma] tier-B SALAD floor")
+                    help="[legacy] tier-B SALAD floor")
     ap.add_argument("--sem_lc_max", type=int, default=2,
-                    help="[ma] max tier-B candidates per submap")
+                    help="[legacy] max tier-B candidates per submap")
     ap.add_argument("--bd_nmin", type=int, default=2,
-                    help="[ma] bidesc: instances per side below this -> UNKNOWN")
+                    help="[legacy] bidesc: instances per side below this -> UNKNOWN")
     ap.add_argument("--bd_pair", type=float, default=0.85,
-                    help="[ma] bidesc: MNN unique-match cosine (tau_pair)")
+                    help="[legacy] bidesc: MNN unique-match cosine (tau_pair)")
     ap.add_argument("--bd_dir", type=float, default=0.85,
-                    help="[ma] bidesc: per-direction MeanTopK threshold (tau_dir)")
+                    help="[legacy] bidesc: per-direction MeanTopK threshold (tau_dir)")
     ap.add_argument("--bd_bi", type=float, default=0.85,
-                    help="[ma] bidesc: harmonic-mean threshold (tau_bi)")
+                    help="[legacy] bidesc: harmonic-mean threshold (tau_bi)")
     ap.add_argument("--bd_nuniq", type=int, default=2,
-                    help="[ma] bidesc: min unique MNN matches for PASS")
+                    help="[legacy] bidesc: min unique MNN matches for PASS")
     ap.add_argument("--bd_kbag", type=int, default=16,
-                    help="[ma] bidesc: per-frame instance-id cap (by objectness)")
+                    help="[ma] IDLV k: instances kept per keyframe for verification (top-k by objectness)")
     ap.add_argument("--s2_hard_reject", default="LARGE_VIEW_CHANGE,T_FAR,M_LOW",
-                    help="comma list of Stage-2 statuses that hard-reject without coloc; "
+                    help="[legacy] comma list of Stage-2 statuses that hard-reject without coloc; "
                          "statuses left out fall through to coloc with the raised (veto) bar")
     ap.add_argument("--s2_lvc_first", default="off", choices=["on", "off"],
-                    help="Stage-2: theta_R > tau_theta hard-rejects before the t/Ed/ER gates")
+                    help="[legacy] Stage-2: theta_R > tau_theta hard-rejects before the t/Ed/ER gates")
     ap.add_argument("--s2_t_noise", default="off", choices=["on", "off"],
-                    help="noise-aware T_FAR gate: widen by d_ref*sin(E_R)")
+                    help="[legacy] Stage-2 noise-aware T_FAR gate: widen by d_ref*sin(E_R)")
     ap.add_argument("--proposal_conf", default="gate", choices=["gate", "prefer"],
                     help="gate = proposals own only geometry-valid pixels (shipped); prefer = ownership on "
                          "all finite pixels, 3D footprint from valid pixels when any (see SemConfig)")
@@ -264,19 +292,22 @@ def main():
                     help="proposal mode for the current frame's LOOP-VERIFICATION evidence only "
                          "(transient bag, never enters the InstanceTable); map keeps --proposal_conf")
     ap.add_argument("--lc_history", default="bag", choices=["map", "bag"],
-                    help="rigid mode history side: map instances of the history frame, or that frame's own transient bag")
+                    help="IDLV history side: that keyframe's own instance bag (default), or the map instances it observed")
     ap.add_argument("--sem_lc_mode", default="rigid", choices=["bidesc", "rigid", "joint"],
-                    help="rigid = the shipped IDLV verifier (MNN pairs >= rigid_tau; with --rigid_geom off "
-                         "PASS iff >= rigid_min_inliers pairs); bidesc = old S1 Bi-Desc (+S2 layout) rules")
-    ap.add_argument("--rigid_tau", type=float, default=0.85)
-    ap.add_argument("--rigid_eps", type=float, default=0.15, help="inlier radius as a fraction of median matched depth")
-    ap.add_argument("--rigid_min_inliers", type=int, default=4)
+                    help="rigid = IDLV, the final verifier (mutual-NN instance-descriptor pairs with cos >= "
+                         "rigid_tau; PASS iff >= rigid_min_inliers pairs); bidesc / joint = [legacy] verifiers")
+    ap.add_argument("--rigid_tau", type=float, default=0.85,
+                    help="IDLV tau: min descriptor cosine of a mutual-NN instance pair")
+    ap.add_argument("--rigid_eps", type=float, default=0.15,
+                    help="[ablation, --rigid_geom on] inlier radius as a fraction of median matched depth")
+    ap.add_argument("--rigid_min_inliers", type=int, default=4,
+                    help="IDLV m: min number of matched instance pairs to accept a loop candidate")
     ap.add_argument("--rigid_geom", default="off", choices=["on", "off"],
-                    help="off = shipped method: accept on matched-pair count alone; on = + triplet-Kabsch layout check (ablation)")
+                    help="off = final method: accept on matched-pair count alone; on = + triplet-Kabsch layout check [ablation]")
     ap.add_argument("--rigid_lowobj", default="reject", choices=["reject", "coloc"],
                     help="frames with < rigid_min_inliers instances: reject, or hand to coloc")
     ap.add_argument("--sem_lc_unknown", default="fail", choices=["coloc", "fail"],
-                    help="S1 UNKNOWN handling: 'fail' = hard-reject (default; uniform "
+                    help="[legacy, bidesc mode] S1 UNKNOWN handling: 'fail' = hard-reject (default; uniform "
                          "with M_LOW — no instance evidence, no edge), 'coloc' = fall "
                          "through to the normal coloc bar")
     ap.add_argument("--snapshot_pts", type=int, default=50000,
@@ -285,17 +316,22 @@ def main():
                     help="write per-submap reconstruction snapshots to <out>/snapshots "
                          "(render with scripts/render_snapshots.py)")
     ap.add_argument("--bd_s2", default="off", choices=["on", "off"],
-                    help="[bidesc mode] Stage-2 layout-graph verdict (on = S1+S2 ablation)")
+                    help="[legacy, bidesc mode] Stage-2 layout-graph verdict (on = S1+S2 ablation)")
     ap.add_argument("--sem_lc_dump", action="store_true",
                     help="dump per-candidate scene-graph JSONs to <out>/semlc_dump "
                          "(render with scripts/render_semlc_graph.py)")
     ap.add_argument("--bd_desc_src", default="proposal", choices=["map", "proposal"],
-                     help="bidesc current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs (association-independent)")
+                     help="[legacy, bidesc mode] current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs")
     ap.add_argument("--sem_lc_coloc", type=float, default=0.50,
-                    help="[ma] stricter coloc gate for tier-B edges (weak SALAD "
+                    help="[legacy] stricter coloc gate for tier-B edges (weak SALAD "
                          "prior needs stronger geometry); <=0 uses coloc_ratio")
     ap.add_argument("--depth_max", type=float, default=0.0, help="[ma] clamp far depth (m)")
     ap.add_argument("--gt", default=None, help="[ma] GT trajectory for ATE report")
+    ap.add_argument("--esam_geo", action="store_true",
+                    help="[ma] also dump <out>/esam_geo/ (per-frame world point maps + rgb + conf + poses of the final map) for ESAM on predicted geometry")
+    ap.add_argument("--demo_dump", action="store_true",
+                    help="[ma] also write frames.txt / depth_pred.npz / poses_online.npy / pose_events.npz / capture.npz (demo video; results unchanged)")
+    ap.add_argument("--dataset", default=None, help="[ma] dataset tag for esam_geo/meta.json (default: parent dir name of --data)")
     ap.add_argument("--conf_gate_coef", type=float, default=1.0,
                     help="[ma] scale on the per-submap mean-conf validity gate "
                          "(<1 keeps more points -> more coverage, noisier voxels)")
@@ -358,6 +394,8 @@ def main():
         elif a.resolution:
             w_, h_ = [int(x) for x in a.resolution.lower().split("x")]; res_kw["resolution"] = (w_, h_)
         res_kw.update(_assoc_kwargs(a))
+        if a.chunk_size:
+            res_kw["chunk_size"] = a.chunk_size
         cfg = SemConfig(box_scale_mode="first_chunk", conf_gate_coef=a.conf_gate_coef,
                         filter_min_count=a.filter_min_count,
                         **kv_kwargs, **model_kwargs, proposal_conf_mode=a.proposal_conf,
@@ -365,7 +403,7 @@ def main():
         run_ma_slam(a, cfg)
         return
 
-    cfg = SemConfig(chunk_size=a.chunk_size, box_scale_mode="gt_seq_median", proposal_conf_mode=a.proposal_conf,
+    cfg = SemConfig(chunk_size=a.chunk_size or 8, box_scale_mode="gt_seq_median", proposal_conf_mode=a.proposal_conf,
                     save_2d_masks=a.save_2d_masks, mask_2d_top_k=a.mask_top_k,
                     **kv_kwargs, **model_kwargs)
     name = a.name or os.path.basename(os.path.normpath(a.data))

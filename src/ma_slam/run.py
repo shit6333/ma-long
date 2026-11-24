@@ -58,7 +58,7 @@ def main():
                          "green(query)/red(match) PLY in <out>/coloc/ for visual inspection")
     ap.add_argument("--keyframe_disparity", type=float, default=50.0,
                     help="LK disparity keyframe gate (pixels): drop frames whose mean optical-flow "
-                         "displacement vs the last keyframe is below this. Default 25 (on); "
+                         "displacement vs the last keyframe is below this. Default 50 (on); "
                          "0 = off (consecutive frames). submap_size then counts keyframes.")
     ap.add_argument("--voxel_size", type=float, default=DEFAULT_CONFIG["Pointcloud"]["voxel_size"])
     ap.add_argument("--max_points", type=int, default=DEFAULT_CONFIG["Pointcloud"]["max_points"],

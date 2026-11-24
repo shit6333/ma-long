@@ -618,10 +618,14 @@ class MaSlam:
             self.graph.optimize()
             self._unopt_loop_edges = 0
 
+        poses_txt = os.path.join(output_dir, "camera_poses.txt")
         if self.hooks is not None:
+            # trajectory + loop log first: a hook export can stall on a diverged map (huge extent)
+            self.map.write_poses(self.graph, poses_txt)
+            with open(os.path.join(output_dir, "loops.txt"), "w") as f:
+                f.write("\n".join(self.loop_log) + ("\n" if self.loop_log else ""))
             self.hooks.on_finish(self.map, self.graph)       # final graph, pre-export
 
-        poses_txt = os.path.join(output_dir, "camera_poses.txt")
         self.map.write_poses(self.graph, poses_txt)
         combined_ply = os.path.join(output_dir, "combined_pcd.ply")
         pc = self.cfg["Pointcloud"]

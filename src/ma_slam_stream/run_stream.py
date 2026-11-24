@@ -297,32 +297,33 @@ def main():
     sp.add_argument("--h2o_subsample", type=float, default=0.25,
                     help="[h2o] query subsample for colsum scores (0.25 validated: "
                          "AP par with full scores, colsum cost ~gone)")
-    # ── instance-LC (semantic-assisted loop candidates; needs --semantic) ──
+    # ── loop verification (needs --semantic). Default = IDLV, the final method: every SALAD candidate
+    #    needs >= 4 mutual-NN instance-descriptor pairs (cos >= 0.85) before the geometric check.
+    #    Flags marked [legacy] belong to earlier verifier designs and do not affect the default path. ──
     sp.add_argument("--sem_lc", default="veto", choices=["off", "shadow", "enforce", "veto"],
-                    help="instance-bag gating of SALAD tier-B candidates: shadow = "
-                         "log SEMLC verdicts only (default), enforce = gated tier-B "
-                         "loops become real edges")
+                    help="instance-level loop verification: veto = IDLV gate on every SALAD candidate "
+                         "(default); off = geometric check only; shadow / enforce = [legacy] tier-B mining")
     sp.add_argument("--sem_lc_floor", type=float, default=0.45,
-                    help="tier-B SALAD floor: candidates in [floor, sim_threshold) "
+                    help="[legacy] tier-B SALAD floor: candidates in [floor, sim_threshold) "
                          "go through the instance gate")
     sp.add_argument("--sem_lc_max", type=int, default=2,
-                    help="max tier-B candidates per submap (coloc budget)")
+                    help="[legacy] max tier-B candidates per submap (coloc budget)")
     sp.add_argument("--bd_nmin", type=int, default=2,
-                    help="bidesc: instances per side below this -> UNKNOWN")
+                    help="[legacy] bidesc: instances per side below this -> UNKNOWN")
     sp.add_argument("--bd_pair", type=float, default=0.85,
-                    help="bidesc: MNN unique-match cosine (tau_pair)")
+                    help="[legacy] bidesc: MNN unique-match cosine (tau_pair)")
     sp.add_argument("--bd_dir", type=float, default=0.85,
-                    help="bidesc: per-direction MeanTopK threshold (tau_dir)")
+                    help="[legacy] bidesc: per-direction MeanTopK threshold (tau_dir)")
     sp.add_argument("--bd_bi", type=float, default=0.85,
-                    help="bidesc: harmonic-mean threshold (tau_bi)")
+                    help="[legacy] bidesc: harmonic-mean threshold (tau_bi)")
     sp.add_argument("--bd_nuniq", type=int, default=2,
-                    help="bidesc: min unique MNN matches for PASS")
+                    help="[legacy] bidesc: min unique MNN matches for PASS")
     sp.add_argument("--bd_kbag", type=int, default=16,
-                    help="bidesc: per-frame instance-id cap (by objectness)")
+                    help="IDLV k: instances kept per keyframe for verification (top-k by objectness)")
     sp.add_argument("--bd_desc_src", default="proposal", choices=["map", "proposal"],
-                     help="bidesc current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs (association-independent)")
+                     help="[legacy, bidesc mode] current-side descriptors: map running-mean (id-based) or the frame's raw proposal descs")
     sp.add_argument("--sem_lc_coloc", type=float, default=0.50,
-                    help="stricter coloc gate for tier-B edges; <=0 uses coloc_ratio")
+                    help="[legacy] stricter coloc gate for tier-B edges; <=0 uses coloc_ratio")
 
     add_capture_args(ap)                          # --width/--height/--fps/--k/--enable_ir/... (local only)
     a = ap.parse_args()

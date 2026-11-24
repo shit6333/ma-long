@@ -8,7 +8,7 @@ golden-gt and ma_slam-geometry outputs.
 
 or from the shell (identical to the reference repo usage):
 
-    cd /mnt/HDD4/ricky/OpenSe3r && python query_instance_semantic.py \
+    cd <OpenSe3r root, or this repo's vendor/> && python query_instance_semantic.py \
         --instance_labels_npz <out>/<name>_instance_labels.npz \
         --instance_sem_queries_npz <out>/<name>_instance_sem_queries.npz \
         --benchmark 20 --backbone tips-v2-l14 --output_dir <out> --demo_name <name>

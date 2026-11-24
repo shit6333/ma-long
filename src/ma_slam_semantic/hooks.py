@@ -28,8 +28,16 @@ from ma_slam_semantic.bidesc_lc import (BiDescConfig, BiDescVerdict, FrameIndex,
 class SemanticHooks:
     def __init__(self, cfg: SemConfig, out_dir: str, name: str = "scene",
                  device: Optional[str] = None, gt_positions=None, gt_poses=None, align_mode: str = "pos",
-                 lc_cfg: Optional[BiDescConfig] = None, gt_mesh: Optional[str] = None):
+                 lc_cfg: Optional[BiDescConfig] = None, gt_mesh: Optional[str] = None,
+                 esam_geo: bool = False, esam_meta: Optional[dict] = None):
         self.cfg = cfg
+        # ESAM predicted-geometry side output (<out>/esam_geo/): per-frame pixel-aligned world point maps of
+        # the final map + alignment/meta, so ESAM runs on byte-identical geometry to our regime-C export.
+        self.esam_geo = esam_geo
+        self.esam_meta = dict(esam_meta or {})
+        self._c2w_online = {}                   # frame id -> c2w when the frame was first mapped
+        self.demo_dump = False                  # --demo_dump: per-keyframe depth / online poses / pose events / proposal capture
+        self._dd = None
         self.gt_mesh = gt_mesh                  # GT surface (ply) for align_mode 'sim3map' (1-DoF global scale fit)
         self.out_dir = out_dir
         self.name = name
@@ -66,6 +74,9 @@ class SemanticHooks:
         if self.table is None:
             self.resolver = SlamGeoResolver(gmap, graph, self.cfg.resolution)
             self.table = InstanceTable(self.cfg, self.resolver)
+        if self.esam_geo and not sm.is_lc:
+            for i in range(sm.n):
+                self._c2w_online.setdefault(int(sm.frame_ids[i]), graph.get_pose(sm.key(i)).copy())
         delta = self.tracker.update(gmap, graph)
         if delta > self.cfg.kv_reset_delta:
             print(f"[sem_hooks] max pose delta {delta:.3f} m > {self.cfg.kv_reset_delta}"
@@ -80,6 +91,8 @@ class SemanticHooks:
             props, pix_map, _ = make_proposals(out, sub, self.cfg,
                                                sem_backbone=self.model.semantic_backbone)
             assign = self.table.match_chunk(props, sub["frame_keys"], pix_map)
+            if self.demo_dump:
+                self._demo_capture(sm, graph, sub, props, pix_map, assign)
             paths = [sm.image_paths[i] for i in sub["frame_idx"]]
             cb = getattr(self, "chunk_callback", None)    # e.g. the stream viewer
             if cb is not None:
@@ -145,6 +158,8 @@ class SemanticHooks:
             self.snap.write_step(gmap, graph, table=self.table,
                                  loop_events=self.loop_events,
                                  voxel_size=self.cfg.voxel_size, n_frames=self.n_frames)
+        if self.demo_dump:
+            self._demo_pose_event(gmap, graph)
 
     def verify_loop_candidate(self, q_path: str, m_path: str):
         """Bi-Desc verdict for a SALAD loop candidate (solver-initiated; read-only).
@@ -379,7 +394,7 @@ class SemanticHooks:
                   f"p10={np.percentile(ns,10):.0f} p50={np.percentile(ns,50):.0f} "
                   f"p90={np.percentile(ns,90):.0f} | frames<{self.lc_cfg.n_min}: "
                   f"{(ns < self.lc_cfg.n_min).mean()*100:.0f}%")
-        T_align = None
+        T_align = None; T_map = None; s1_med = None; gt_tree = None
         if self.gt_positions is not None:
             from eval import umeyama_sim3
             # per-frame optimized camera centres, deduped by FRAME ID (filename
@@ -421,6 +436,7 @@ class SemanticHooks:
                     if best is None or med < best[1]:
                         best = (float(s_try), med, R_s)
                 d1, _ = tree.query(P @ R_pos.T + t_pos)
+                s1_med, gt_tree = float(np.median(d1)), tree
                 print(f"[sem_hooks] sim3map align: global scale {best[0]:.2f} (map->GT-surface median {best[1]:.3f} m; "
                       f"s=1.00 gives {float(np.median(d1)):.3f} m; trajectory-Umeyama scale {float(s_al):.3f})")
                 R_m = best[0] * best[2]; T_map = np.eye(4); T_map[:3, :3], T_map[:3, 3] = R_m, gt.mean(0) - R_m @ est.mean(0)
@@ -457,7 +473,10 @@ class SemanticHooks:
             # (SLAM frame) into the same frame as the instance npz/table.
             import json
             with open(os.path.join(self.out_dir, "alignment.json"), "w") as f:
-                json.dump({"T_align": T_align.tolist(),
+                T_pos = np.eye(4); T_pos[:3, :3], T_pos[:3, 3] = R_pos, t_pos
+                json.dump({"T_align": T_align.tolist(), "align_mode": self.align_mode,
+                           "T_pos": T_pos.tolist(),
+                           "T_sim3map": (None if T_map is None else T_map.tolist()),
                            "note": "instance npz/table are in the GT-mesh frame; "
                                    "apply T_align to SLAM-frame poses/points"}, f, indent=2)
         from ma_slam_semantic.export import export_all
@@ -480,3 +499,149 @@ class SemanticHooks:
             res2 = export_all(self.table, num_frames=self.n_frames, out_dir=sub, name=self.name, cfg=self.cfg,
                               transformation=sec[1], do_final_merge=False)
             print(f"[sem_hooks] secondary export (align={sec[0]}): {res2['n_instances']} instances -> {sub}")
+        if self.esam_geo:
+            self._dump_esam_geo(gmap, graph, T_align, s1_med, gt_tree)
+        if self.demo_dump:
+            self._demo_pose_event(gmap, graph)
+            self._demo_write()
+
+    # ------------------------------------------------------------------ --demo_dump (read-only side output)
+    def _demo_capture(self, sm, graph, sub, props, pix_map, assign) -> None:
+        """Per keyframe: model-input RGB, depth, raw conf, validity (the conf gate the map used), K, pose at
+        first integration; per proposal: keyframe, instance id at integration, world voxels (SLAM frame)."""
+        import torch
+        from ma_slam_semantic.bridge import _crop_resize_map
+        if self._dd is None:
+            self._dd = {k: [] for k in ("frames", "frame_id", "img", "depth", "conf", "valid", "K", "conf_thr",
+                                        "pose", "own", "prop_frame", "prop_assign", "prop_vox", "events")}
+            self._dd["own_res"] = None
+        d = self._dd
+        T0, P0 = len(d["frames"]), len(d["prop_frame"])
+        tw, th = self.cfg.resolution
+        imgs = sub["images"][0]
+        pm = pix_map
+        d["own_res"] = [int(pm.shape[1]), int(pm.shape[2])]
+        if tuple(pm.shape[1:]) != (th, tw):
+            pm = torch.nn.functional.interpolate(pm[:, None].float(), size=(th, tw), mode="nearest")[:, 0].long()
+        pm = pm.numpy()
+        for t, i in enumerate(sub["frame_idx"]):
+            d["frames"].append(sm.image_paths[i]); d["frame_id"].append(int(sm.frame_ids[i]))
+            d["img"].append(((imgs[t].permute(1, 2, 0).numpy() + 1.0) * 127.5).round().clip(0, 255).astype(np.uint8))
+            d["depth"].append(sub["depth"][0][t].numpy().astype(np.float16))
+            d["conf"].append(_crop_resize_map(sm.conf[i].astype(np.float32), self.cfg.resolution).astype(np.float16))
+            d["valid"].append(sub["valid"][0][t].numpy().astype(bool))
+            d["K"].append(sub["intrinsics"][0][t].numpy().astype(np.float32))
+            d["conf_thr"].append(float(sm.conf_threshold * self.cfg.conf_gate_coef))
+            d["pose"].append(np.asarray(sm.frame_pose_global(graph, i), dtype=np.float64).copy())
+            d["own"].append(np.where(pm[t] >= 0, pm[t] + P0, -1).astype(np.int32))
+        for k, p in enumerate(props):
+            d["prop_frame"].append(T0 + int(p["frame"])); d["prop_assign"].append(int(assign[k]))
+            d["prop_vox"].append(np.array(sorted(p["voxels"]), dtype=np.int32).reshape(-1, 3))
+
+    def _demo_pose_event(self, gmap, graph) -> None:
+        if self._dd is None:
+            return
+        poses = {}
+        for sm in gmap.ordered():
+            if sm.is_lc:
+                continue
+            for i in range(sm.n):                      # last-wins by frame id, like map.write_poses
+                poses[int(sm.frame_ids[i])] = np.asarray(graph.get_pose(sm.key(i)), dtype=np.float32).copy()
+        self._dd["events"].append((len(self._dd["frames"]) - 1, poses, len(self.loop_events)))
+
+    def _demo_write(self) -> None:
+        d = self._dd
+        if d is None:
+            return
+        o = self.out_dir; T = len(d["frames"])
+        with open(os.path.join(o, "frames.txt"), "w") as f:
+            f.write("# keyframe_index source_frame_id image_path\n")
+            for i, (p, fid) in enumerate(zip(d["frames"], d["frame_id"])):
+                f.write(f"{i} {fid} {p}\n")
+        np.savez_compressed(os.path.join(o, "depth_pred.npz"), depth=np.stack(d["depth"]), conf=np.stack(d["conf"]),
+                            valid=np.stack(d["valid"]), K=np.stack(d["K"]), img=np.stack(d["img"]),
+                            conf_thr=np.array(d["conf_thr"], np.float32))
+        np.save(os.path.join(o, "poses_online.npy"), np.stack(d["pose"]))
+        idx = {fid: i for i, fid in enumerate(d["frame_id"])}
+        ev = np.full((len(d["events"]), T, 4, 4), np.nan, np.float32)
+        for e, (_, poses, _) in enumerate(d["events"]):
+            for fid, P in poses.items():
+                if fid in idx:
+                    ev[e, idx[fid]] = P
+        np.savez_compressed(os.path.join(o, "pose_events.npz"), event_frame=np.array([e[0] for e in d["events"]], np.int32),
+                            n_loops=np.array([e[2] for e in d["events"]], np.int32), poses=ev)
+        root = getattr(self.table, "_merge_root", {}); dropped = getattr(self.table, "_dropped", set())
+        inst = []
+        for a in d["prop_assign"]:
+            r = root.get(a, a)
+            inst.append(r if (a >= 0 and r in self.table.records and r not in dropped) else -1)
+        nv = np.array([len(v) for v in d["prop_vox"]], np.int32)
+        np.savez_compressed(os.path.join(o, "capture.npz"), frames=np.array(d["frame_id"], np.int32),
+                            own=np.stack(d["own"]), prop_frame=np.array(d["prop_frame"], np.int32),
+                            prop_inst=np.array(inst, np.int32), prop_inst_online=np.array(d["prop_assign"], np.int32),
+                            prop_nvox=nv, prop_vox=(np.concatenate(d["prop_vox"], 0) if len(nv) else np.zeros((0, 3), np.int32)),
+                            voxel_size=np.float32(self.cfg.voxel_size), own_native_res=np.array(d["own_res"], np.int32))
+        print(f"[sem_hooks] demo_dump: {T} keyframes, {len(inst)} proposals ({int((np.array(inst) >= 0).sum())} kept), "
+              f"{len(d['events'])} pose events -> {o}")
+
+    def _dump_esam_geo(self, gmap, graph, T_align, s1_med, gt_tree) -> None:
+        """<out>/esam_geo/: one npz per frame of the final map (non-LC submaps, deduped by frame id,
+        last-wins — the same rule as the alignment centres above), SLAM frame, NOT conf-gated, NOT
+        T_align-ed. alignment.json (T_align) sits in <out>/ and is copied next to it."""
+        import json, shutil
+        d = os.path.join(self.out_dir, "esam_geo"); fd = os.path.join(d, "frames")
+        os.makedirs(fd, exist_ok=True)
+        own = {}
+        for sm in gmap.ordered():
+            if sm.is_lc:
+                continue
+            for i in range(sm.n):
+                own[int(sm.frame_ids[i])] = (sm, i)
+        coef = self.cfg.conf_gate_coef
+        rng = np.random.default_rng(0); samp = {1.0: [], coef: []}
+        H = W = None
+        for fid in sorted(own):
+            sm, i = own[fid]
+            c2w = graph.get_pose(sm.key(i))
+            pts = sm.frame_points_global(graph, i).astype(np.float32)
+            conf = np.asarray(sm.conf[i], np.float32)
+            mask = np.ones(conf.shape, bool) if sm.mask is None else np.asarray(sm.mask[i], bool)
+            rgb = np.asarray(sm.colors[i])
+            if rgb.dtype != np.uint8:
+                rgb = np.clip(rgb * (255.0 if rgb.max() <= 1.0 else 1.0), 0, 255).astype(np.uint8)
+            H, W = conf.shape
+            extra = {} if fid not in self._c2w_online else {"c2w_online": self._c2w_online[fid]}
+            if sm.intrinsics is not None:          # backbone-predicted pinhole K at the point-map resolution
+                extra["K"] = np.asarray(sm.intrinsics[i], np.float64)
+            np.savez_compressed(os.path.join(fd, f"{fid:06d}.npz"), frame_id=fid,
+                                image_name=os.path.basename(sm.image_paths[i]), pts_world=pts, conf=conf,
+                                mask=mask, rgb=rgb, c2w=c2w.astype(np.float64),
+                                conf_threshold=np.float32(sm.conf_threshold), submap_base=sm.base_id, **extra)
+            for c in samp:
+                m = (conf > sm.conf_threshold * c) & mask
+                q = pts[m]
+                if len(q) > 4000:
+                    q = q[rng.choice(len(q), 4000, replace=False)]
+                samp[c].append(q)
+        if os.path.exists(os.path.join(self.out_dir, "alignment.json")):
+            shutil.copy(os.path.join(self.out_dir, "alignment.json"), os.path.join(d, "alignment.json"))
+        sanity = {}
+        if T_align is not None and gt_tree is not None:
+            for c, qs in samp.items():
+                Q = np.concatenate(qs, 0)
+                dd, _ = gt_tree.query(Q @ T_align[:3, :3].T + T_align[:3, 3])
+                sanity[f"median_nn_conf{c:g}"] = float(np.median(dd))
+            msg = " | ".join(f"conf_coef {k[len('median_nn_conf'):]}: {v:.3f} m" for k, v in sanity.items())
+            print(f"[esam_geo] sanity: T_align(conf-gated pts_world) -> GT mesh median NN {msg} "
+                  f"(hooks 's=1.00 gives' {s1_med:.3f} m{'' if self.align_mode == 'pos' else ', NOTE align != pos'})")
+            sanity["hooks_s1_median"] = s1_med
+        meta = dict(self.esam_meta)
+        meta.update(scene=self.name, H=int(H) if H else None, W=int(W) if W else None,
+                    n_saved_frames=len(own), conf_coef=coef, conf_gate_coef=coef,
+                    conf_threshold="per-frame key 'conf_threshold' in each npz (= its submap's mean conf); "
+                                   "gate = conf > conf_threshold * conf_coef & mask",
+                    align_mode=self.align_mode, gt_mesh=self.gt_mesh, sanity=sanity,
+                    n_loop_events=len(self.loop_events))
+        with open(os.path.join(d, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+        print(f"[esam_geo] dumped {len(own)} frames ({H}x{W}) -> {d}")

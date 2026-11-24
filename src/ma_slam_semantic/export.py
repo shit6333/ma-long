@@ -78,6 +78,8 @@ def export_all(table: InstanceTable, num_frames: int, out_dir: str, name: str,
         max_extent_m=cfg.filter_max_extent_m,
         elongated_max_count=cfg.filter_elongated_max_count,
     )
+    if not hasattr(table, "_dropped"):
+        table._dropped = set(dropped)                # read by --demo_dump
     color_map = color_map_for_table(table, mode="desc")
     print(f"[export] noise filter dropped {len(dropped)}/{len(table)}")
 

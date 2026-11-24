@@ -483,6 +483,7 @@ class InstanceTable:
                     if ra != rb:
                         parent[max(ra, rb)] = min(ra, rb)
 
+        self._merge_root = {i: find(i) for i in ids}     # read by --demo_dump (pre-merge id -> surviving id)
         merged = 0
         for i in ids:
             r = find(i)

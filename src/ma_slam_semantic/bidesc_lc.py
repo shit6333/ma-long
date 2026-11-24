@@ -1,5 +1,11 @@
-"""Bi-Desc LC (v2) — bidirectional instance-descriptor verification of SALAD loop
-candidates, VGGT-SLAM-2.0-inspired redesign of instance_lc (which is retired).
+"""Instance-level verification of SALAD loop candidates.
+
+The final method is IDLV (``BiDescConfig.mode == 'rigid'`` with ``rigid_geom=False``; ``verify_rigid``):
+mutual-NN instance-descriptor pairs with cos >= ``rigid_tau``, PASS iff >= ``rigid_min_inliers`` pairs,
+evidence = each keyframe's top-``k_bag`` instances (``FrameIndex``). The rest of this module is the earlier
+Bi-Desc (S1) / layout (S2) design, kept so archived runs stay reproducible; the original notes follow.
+
+Bi-Desc LC (v2) — bidirectional instance-descriptor verification of SALAD loop candidates.
 
 Per-frame storage is the instance IDs a frame's proposals were associated to plus
 (by default) their raw descriptors — no extra model forward, no area filtering

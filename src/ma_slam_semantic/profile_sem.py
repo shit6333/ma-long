@@ -10,7 +10,7 @@ so per-block reset_peak is sound), runs the golden 005 path, and prints:
   - KV-cache bytes growth per chunk
 
     PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.profile_sem \
-        --data /mnt/HDD4/ricky/data/instance_eval_data/scenenn/oni/005 --max_frames 64
+        --data <scenenn_scene_dir> --max_frames 64
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def _tensor_bytes(x) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="/mnt/HDD4/ricky/data/instance_eval_data/scenenn/oni/005")
+    ap.add_argument("--data", required=True, help="GT-geometry scene dir (see --demo_type)")
     ap.add_argument("--demo_type", default="scenenn_gt")
     ap.add_argument("--max_frames", type=int, default=64)
     ap.add_argument("--chunk_size", type=int, default=8)
