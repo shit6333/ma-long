@@ -109,7 +109,7 @@ python -m ma_slam_semantic.deploy --dir outputs/ma_sem/<scene> --name <scene>
 | 旋鈕 | 預設 | 說明 |
 |---|---|---|
 | `--conf_gate_coef` | 1.0 | 幾何 validity gate（× submap 平均 conf）。**實務 inference 留 1.0**（擋不準的 pred geo）；**benchmark 報表用 0.5**（GT-mesh 覆蓋率計分下 5-scene mean AP 20.8→25.3）。效果 scene-specific：幾何乾淨的場景放鬆只會進雜訊。 |
-| `--chunk_size`（串流：`--sem_chunk_size`） | 4 | 每次 causal forward 幀數，**純 VRAM 旋鈕**（結果不變）：4≈15GB、8≈26GB 峰值 |
+| `--chunk_size`（串流：`--sem_chunk_size`） | 4 | 可調整的 semantic mapping chunk size：Ident3R 每次 forward 處理的幀數（與 DA3 的 `--submap_size` 無關） |
 | `--kv_policy` | `h2o`（離線、串流皆同；`none` = flat KV 對照） | flat KV 成長 62MB/幀（1000 幀=61GB）；`h2o`（STAC：pinned frame0 + `--h2o_recent` 8 + heavy-hitter `--h2o_hh` 8、`--h2o_subsample 0.25` 已驗證 AP 持平）恆定 ~0.7GB |
 | `--no_loop` | off | LC 開著 instance map 會自癒（s0231：213 vs 240 instances） |
 | `--sem_lc` / `--sem_lc_mode` / `--rigid_geom` | `veto` / `rigid` / `off` | IDLV（論文方法）：SALAD 候選需 >=4 個 MNN instance 配對（cos>=0.85）才進幾何驗證，否則 REJECT。`bidesc`（舊 S1/S2 規則）、`--rigid_geom on`（layout）、`--bd_s2 on` 皆為 ablation |
