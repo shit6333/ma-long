@@ -6,21 +6,21 @@ ma_slam 線上 SLAM 幾何上。參考設定 = OpenSe3r `005_..._geo_default_con
 （pipeline 旋鈕在 `config.SemConfig`;模型架構由 checkpoint 自述）。完整計畫與 gate 紀錄見
 [docs/semantic_branch_plan.md](../../docs/semantic_branch_plan.md)。
 
-> **2026-08-28:預設 checkpoint 切為 `a1_pq`(A1 ep28 + P/Q ep14,handoff §6 出貨檔)** ——
-> ma-slam 驗收 SceneNN-12 32.37/55.10/68.68(文件 32.35/53.71/68.30)、TUM S1+S2 0.0380(semconf_pq 0.0384)。
-> `--ckpt semconf_pq` 可切回舊模型。
-> **模型換代(2026-08-25)— 完成並通過驗收**(golden 零回歸;SceneNN-12 `semconf_pq`
-> p_top25q 29.65/49.56/67.14,同 cluster obj 27.92/46.35/62.12;A1 smoke 005 27.55/43.56/60.65)。 架構不再寫死在 config
-> (`FROZEN_MODEL_ARGS` 已刪除):`sem_model.build_model_from_ckpt` 從 checkpoint 自帶的
-> args 建模、再用權重校正(`vendor/semantic_mapping/model.py::_infer_arch_from_weights`
-> —— descfix ckpt 的 args 寫 descriptor MLP=0 但檔案有 3 層;`pq_head` 有無同理),
-> trainable key 有任何 missing/unexpected 直接 raise。`--ckpt {semconf|semconf_pq|a1|path}`
-> 切換模型(預設 `semconf_pq`);`--ranker p_top25q`(P/Q 排序,無 P/Q head 自動退回
-> objectness 並在 export 印警告);`--sem_agg auto`(A1 無 dense head → 走 frozen-TIPS
-> textregion pool)。細節與坑見 **[docs/opense3r_model_handoff.md](../../docs/opense3r_model_handoff.md)**。
-> vendor/ 已同步 live repo 的 12 個檔案 + 新增 `opense3r/pq_head.py`(注意:H2O KV 的
-> `stac_kv/` + `causal_branch.register_kv_mgr` + `init_kv_cache` 的 `reset_kv_mgr()` 是
-> ma-slam 本地 patch,live repo 沒有 —— 之後 re-vendor 時要保留)。
+**目前狀態（final）：** 預設值就是最終設定，`--geometry ma` 不需要任何額外旗標。
+
+| 項目 | 預設 | 旗標 |
+|---|---|---|
+| 幾何 | DA3 rgb、50 px keyframe、每個 submap 32 個 keyframe、SE(3) pose graph | `--backend da3 --mode rgb --keyframe_disparity 50 --submap_size 32` |
+| 迴環檢索 | SALAD cos ≥ 0.40、每個 submap 最多 5 個候選 | `--sim_threshold 0.40 --max_per_submap 5` |
+| 迴環驗證（IDLV） | 互為最近鄰的 instance descriptor 配對 cos ≥ τ=0.85，配對數 ≥ m=4 才通過；每個 keyframe 取 objectness 前 k=16 個 instance | `--sem_lc veto --sem_lc_mode rigid --rigid_geom off`；τ=`--rigid_tau`、m=`--rigid_min_inliers`、k=`--bd_kbag` |
+| 幾何驗證 | 兩幀聯合重推論，相機中心距離 / 深度中位數 ≤ 0.70；通過後以 Huber loop factor 加入 | `--coloc_ratio 0.70` |
+| 語意模型 | `a1_pq`（A1 ep28 + P/Q ep14），每次 causal forward 4 幀 | `--ckpt a1_pq --chunk_size 4` |
+| KV cache | H2O：frame 0 + 最近 8 幀 + heavy-hitter 8 幀 | `--kv_policy h2o --h2o_recent 8 --h2o_hh 8 --h2o_decay 0.9 --h2o_subsample 0.25` |
+| instance matching | `0.70·cos(desc) + 0.30·exp(−d/0.25)`，門檻 0.65 | `--assoc new`（預設） |
+
+`--help` 裡標 `[legacy]` 的旗標屬於早期的驗證設計（Bi-Desc S1、layout S2、tier-B mining），只為了重現舊的
+run 而保留，不影響預設路徑。模型架構由 checkpoint 自述（`sem_model.build_model_from_ckpt`），換模型的細節與
+歷史見 [docs/opense3r_model_handoff.md](../../docs/opense3r_model_handoff.md)。
 
 ## 架構
 
@@ -29,7 +29,7 @@ ma_slam (MaSlam, hooks=SemanticHooks)          ← S1: 僅 3 hooks + 2 accessors
   └─ on_submap(sm, gmap, graph)   每個 submap 優化後
        SubmapBridge.chunk()       幾何→張量合約：解析度重採樣(518x336)、MA-conf→validity、
                                   gauge 錨定(序列 frame0=I)、重疊幀去重、[-1,1] 影像
-       split_chunk(8)             KV-causal ⇒ batching 不變；8 幀 sub-batch 控 VRAM
+       split_chunk(4)             KV-causal ⇒ batching 不變；4 幀 sub-batch 控 VRAM
        SemanticModel.forward_chunk()  OpenSe3r forward_semantic + KV 串接 + box_scale
        make_proposals()           鏡射 update_instances 前處理 → process_chunk_to_proposals
        InstanceTable.match_chunk()    provenance 版 instance matching（見下）
@@ -44,14 +44,15 @@ ma_slam (MaSlam, hooks=SemanticHooks)          ← S1: 僅 3 hooks + 2 accessors
 1. **KNN gate**：proposal center 的 point-to-AABB 距離 ≤ `knn_radius=1.0m`，最多
    `max_candidates=32`（取最近）。候選若 M-signature 失效先 re-lift（LC 癒合點）。
 2. **配分**（import `opense3r.instance_post._proposal_pair_score_dict`）：
-   `score = 0.3·cos(desc) + 0.3·vox-IoU + 0.25·exp(−d/0.25)`，`w_sem=0`，
-   vox-IoU = `|A∩B|/min(|A|,|B|)`，d = point-to-AABB。
+   `score = 0.70·cos(desc) + 0.30·exp(−d/0.25)`，d = point-to-AABB（`w_vox=0`、`w_sem=0`；
+   `--assoc old` 還原 2026-09-04 以前的 0.3/0.3/0.25、門檻 0.32，見
+   [docs/config_change_2026-09-04.md](../../docs/config_change_2026-09-04.md)）。
 3. **Hungarian**（`linear_sum_assignment`）一對一指派。
-4. `score ≥ 0.32` → merge（descriptor 累積平均+renorm、center running mean、bbox
+4. `score ≥ 0.65` → merge（descriptor 累積平均+renorm、center running mean、bbox
    union、voxel votes、附加 provenance Obs）；否則 spawn。
 
 Export 時：`rekey_all(force)`（最終 graph 全量 re-lift）→ union-find final merge
-（AABB 相交且 score ≥ 0.75）→ noise filter（`filter_*` knobs）→ 參考格式輸出。
+（AABB 相交且累積 descriptor cos ≥ 0.85）→ noise filter（`filter_*` knobs）→ 參考格式輸出。
 
 ## LC-safe provenance 設計（與參考實作的唯一行為差異）
 
@@ -68,20 +69,23 @@ Export 時：`rekey_all(force)`（最終 graph 全量 re-lift）→ union-find f
 ## 使用
 
 ```bash
-# Golden 測試模式（GT 幾何，重現 OpenSe3r 005 run；S2/S3 正確性 harness）
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.run --geometry gt \
-    --data /mnt/HDD4/ricky/data/instance_eval_data/scenenn/oni/005 \
+# Inference（完整線上 SLAM + 語意）— 預設值 = 最終設定（見最上方的表），只需要資料與輸出路徑。
+# <scene_dir> 底下要有 rgb/；--gt 可省略（有的話會印 ATE，並把 instance 輸出對齊到 GT 座標）
+CUDA_VISIBLE_DEVICES=0 python src/ma_slam_semantic/run.py \
+    --data example_data/scene0378_00 --out outputs/ident3r_s0378 \
+    --gt example_data/scene0378_00/gt_pose.txt
+
+# 對照組：關掉 IDLV（只剩幾何驗證）／完全關掉迴環
+python src/ma_slam_semantic/run.py --data <scene_dir> --out <out> --sem_lc off
+python src/ma_slam_semantic/run.py --data <scene_dir> --out <out> --no_loop
+
+# Golden 測試模式（GT 幾何，重現 OpenSe3r 參考 run；正確性 harness）
+python src/ma_slam_semantic/run.py --geometry gt --data <scenenn_scene_dir> \
     --demo_type scenenn_gt --out outputs/ma_sem/005_golden [--save_2d_masks]
 
-# ma_slam 幾何模式（完整線上 SLAM + 語意）— 預設值 = 最新 Ident3R-SLAM 設定（2026-10-22），不需額外旗標：
-#   --geometry ma --backend da3 --mode rgb --submap_size 32 --keyframe_disparity 50
-#   SALAD 0.40 / top-5 per submap、--sem_lc veto --sem_lc_mode rigid --rigid_geom off（IDLV：只看 MNN 配對數，
-#   cos>=0.85、>=4 對）--lc_proposal_conf prefer --lc_history bag、--kv_policy h2o (8/8, subsample 0.25)
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.run \
-    --data data/tum/fr1_room_dist --out outputs/ma_sem/fr1_room --gt data/tum/fr1_room_dist/gt_pose.txt
-
-# 效能剖析（各模組時間 + VRAM + KV 成長）
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=1 python -m ma_slam_semantic.profile_sem --max_frames 64
+# 效能剖析：語意模型各模組（GT 幾何）／整條 pipeline 各階段時間 + VRAM
+PYTHONPATH=src python -m ma_slam_semantic.profile_sem --data <scenenn_scene_dir> --max_frames 64
+PYTHONPATH=src python -m ma_slam_semantic.profile_pipeline --prof_out prof.json -- --data <scene_dir> --out <out>
 
 # 文字查詢標籤（export 產物上離線跑）
 python - <<'EOF'
@@ -105,7 +109,7 @@ python -m ma_slam_semantic.deploy --dir outputs/ma_sem/<scene> --name <scene>
 | 旋鈕 | 預設 | 說明 |
 |---|---|---|
 | `--conf_gate_coef` | 1.0 | 幾何 validity gate（× submap 平均 conf）。**實務 inference 留 1.0**（擋不準的 pred geo）；**benchmark 報表用 0.5**（GT-mesh 覆蓋率計分下 5-scene mean AP 20.8→25.3）。效果 scene-specific：幾何乾淨的場景放鬆只會進雜訊。 |
-| `chunk_size` / `--sem_chunk_size` | 4 | 每次 causal forward 幀數，**純 VRAM 旋鈕**（結果不變）：4≈15GB、8≈26GB 峰值 |
+| `--chunk_size`（串流：`--sem_chunk_size`） | 4 | 每次 causal forward 幀數，**純 VRAM 旋鈕**（結果不變）：4≈15GB、8≈26GB 峰值 |
 | `--kv_policy` | `h2o`（離線、串流皆同；`none` = flat KV 對照） | flat KV 成長 62MB/幀（1000 幀=61GB）；`h2o`（STAC：pinned frame0 + `--h2o_recent` 8 + heavy-hitter `--h2o_hh` 8、`--h2o_subsample 0.25` 已驗證 AP 持平）恆定 ~0.7GB |
 | `--no_loop` | off | LC 開著 instance map 會自癒（s0231：213 vs 240 instances） |
 | `--sem_lc` / `--sem_lc_mode` / `--rigid_geom` | `veto` / `rigid` / `off` | IDLV（論文方法）：SALAD 候選需 >=4 個 MNN instance 配對（cos>=0.85）才進幾何驗證，否則 REJECT。`bidesc`（舊 S1/S2 規則）、`--rigid_geom on`（layout）、`--bd_s2 on` 皆為 ablation |
@@ -141,18 +145,12 @@ instsem 聚合 SN20 mIoU ~38-40（四配置持平——semantic eval 對覆蓋�
 `vendor/` 鏡像 OpenSe3r 根目錄結構（runtime 閉包 121 檔實測後整包搬核心套件 +
 thirdparty 子集，~15MB code），`slam_opense3r/run.py` 的檔案相對 sys.path 因此原樣可用。
 
-權重在 `vendor/weights/`（**gitignored**，共 ~14GB，已重新命名）：
+權重在 `vendor/weights/`（**gitignored**）：Ident3R checkpoint `opense3r_a1ep28_pq_ep14.pth`（`--ckpt a1_pq`）、
+`vggt_1b.pt`、`tips_v2_oss_l14_{vision,text}.npz`、`fastsam_x.pt`。打包檔 `weights.zip` 的下載、SHA-256 與
+完整清單見 [../ma_slam_stream/SEMANTIC_README.md §2](../ma_slam_stream/SEMANTIC_README.md)。
 
-| 檔案 | 原始來源 |
-|---|---|
-| `opense3r_fastsam_query_semconf.pth` (7.3G) | OpenSe3r `outputs/opense3r_fastsam_query_semconf/checkpoint-last.pth` |
-| `vggt_1b.pt` (4.7G) | OpenSe3r `checkpoints/VGGT.pt`（DINO tokens 來源，frozen） |
-| `tips_v2_oss_l14_{vision,text}.npz` (1.2G/0.7G) | `thirdparty/tips/pytorch/checkpoints/`（由該處相對 symlink 指回來） |
-| `fastsam_x.pt` (139M) | `/mnt/HDD4/ricky/sam_test/FastSAM-x.pt` |
-
-搬機時：repo（含 vendor code）+ `vendor/weights/` 五個檔案 = 完整可跑。ckpt 是
-strict=False 載入——**`FROZEN_MODEL_ARGS` 的架構參數與 ckpt 綁定，不可調**；可調的
-在 `SemConfig`（matching/proposal/filter/KV knobs，預設 = 005 run）。
+搬機時：repo（含 vendor code）+ 解壓後的權重 = 完整可跑。模型架構由 checkpoint 自述、載入時逐 key 檢查；
+可調的在 `SemConfig`（matching / proposal / filter / KV knobs）。
 
 ## 驗證結果（gates）
 
@@ -179,9 +177,3 @@ strict=False 載入——**`FROZEN_MODEL_ARGS` 的架構參數與 ckpt 綁定，
   ~26GB → chunk 4 ~15GB，M2F dAlloc 精準減半），故 `chunk_size` 預設 4；
   **KV cache 線性成長 62.4MB/frame**（1000 幀 = 61GB ⇒ 長序列需 window/H2O
   policy），與 chunk size 無關。ma 模式（+MapAnything 同卡）chunk 8 時總峰值 49.4GB。
-
-## 待辦（S5）
-
-H2O KV policy（`kv_policies.py` seam 已留；KV 成長是長序列的 VRAM 大頭）、KV-reset
-閥門的實測決策（需更大 drift 的場景）、labeled `combined_pcd` 匯出、更多資料集、
-下一個效能目標：forward 66ms 與 match_chunk 的 O(P·C) 配分。
